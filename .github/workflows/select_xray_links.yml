@@ -15,23 +15,50 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl unzip python3
+          sudo apt-get install -y -qq curl unzip python3 openssh-server
           curl -fsSL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
-          sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin
-          sudo chmod +x /usr/local/bin/xray
-          python3 -V
+          sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin && sudo chmod +x /usr/local/bin/xray
+          sudo mkdir -p /run/sshd
+          printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf
+          echo 'root:runnerdebug' | sudo chpasswd
+          sudo /usr/sbin/sshd
+          curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared tunnel --no-autoupdate --url tcp://localhost:22 > /tmp/cf.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+          echo "CF_SSH_URL=$URL"
+          echo "CF_SSH_HOST=${URL#https://}"
+          echo "pass: runnerdebug"
       - name: select links
         env:
           PYTHONUNBUFFERED: "1"
           WORKERS_MAX: "32"
           WORKERS_MIN: "4"
-        run: python3 -u select_links.py
+          PROGRESS_FILE: data/progress.txt
+        run: |
+          set -e
+          mkdir -p data
+          python3 -u select_links.py &
+          PID=$!
+          while kill -0 $PID 2>/dev/null; do
+            echo "---- $(date -u +%H:%M:%S) ----"
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            echo "CF_SSH_URL=$URL"
+            tail -5 data/progress.txt 2>/dev/null || true
+            uptime
+            sleep 45
+          done
+          wait $PID
       - name: commit results
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet && echo "no changes" && exit 0
+          git diff --cached --quiet && echo no_changes && exit 0
           git commit -m "update selected xray links"
           git push

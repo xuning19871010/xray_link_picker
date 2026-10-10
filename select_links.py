@@ -31,6 +31,7 @@ XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "5"))
 WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "32"))
 WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "4"))
+PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
 
 SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
@@ -69,6 +70,12 @@ _next_port = 20000
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+    try:
+        PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(PROGRESS_FILE, "a") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
 
 
 def link_hash(link: str) -> str:
