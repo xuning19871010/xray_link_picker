@@ -25,12 +25,12 @@ DATA = ROOT / "data"
 DB = DATA / "state.sqlite"
 GOOD_TXT = DATA / "good_links.txt"
 FAILED_TXT = DATA / "failed_links.txt"
-TARGET = int(os.environ.get("TARGET_GOOD", "9999"))
+TARGET = int(os.environ.get("TARGET_GOOD", "2000"))
 PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
 XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
-TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "5"))
-WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "32"))
-WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "4"))
+TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
+WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "384"))
+WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "256"))
 PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
 
 SUBSCRIBE_URLS = [
@@ -402,7 +402,7 @@ def probe(link: str) -> tuple[str, str | None, str]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(0.35)
+        time.sleep(float(os.environ.get("XRAY_WARMUP", "0.15")))
         proxy = f"socks5h://127.0.0.1:{socks_port}"
         try:
             http_get(PROBE_URL, timeout=TIMEOUT, proxy=proxy)
@@ -465,6 +465,43 @@ def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) 
             return False
 
 
+
+def verify_goods(conn: sqlite3.Connection) -> None:
+    """Re-probe all good links; drop dead or duplicate exit IPs."""
+    rows = conn.execute(
+        "SELECT link, exit_ip FROM links WHERE status='good' ORDER BY updated_at"
+    ).fetchall()
+    log(f"verify start count={len(rows)}")
+    seen: set[str] = set()
+    keep = 0
+    drop = 0
+    with ThreadPoolExecutor(max_workers=min(64, max(8, WORKERS_MAX // 2))) as ex:
+        futs = {ex.submit(probe, link): (link, old_ip) for link, old_ip in rows}
+        for fut in as_completed(futs):
+            link, old_ip = futs[fut]
+            try:
+                status, ip, reason = fut.result()
+            except Exception:
+                status, ip, reason = "failed", None, "exc"
+            if status != "good" or not ip:
+                mark(conn, link, "failed", None)
+                drop += 1
+                log(f"VERIFY_DROP reason={reason} old_ip={old_ip}")
+                continue
+            if ip in seen:
+                mark(conn, link, "failed", None)
+                drop += 1
+                log(f"VERIFY_DUP ip={ip}")
+                continue
+            seen.add(ip)
+            # refresh ip if changed
+            if ip != old_ip:
+                mark(conn, link, "good", ip)
+            keep += 1
+    export_txt(conn)
+    log(f"verify done keep={keep} drop={drop} unique_ip={len(seen)}")
+
+
 def good_count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM links WHERE status='good'").fetchone()[0]
 
@@ -499,10 +536,11 @@ def main() -> int:
     while i < len(todo) and good_count(conn) < TARGET:
         # adaptive workers
         busy = cpu_busy()
-        if busy > 0.85:
-            workers = max(WORKERS_MIN, workers // 2)
-        elif busy < 0.45:
-            workers = min(WORKERS_MAX, workers + 4)
+        # network-bound: keep concurrency high; only ease off under severe load
+        if busy > 3.0:
+            workers = max(WORKERS_MIN, workers - 8)
+        elif busy < 1.0:
+            workers = min(WORKERS_MAX, workers + 8)
         batch = todo[i : i + workers * 2]
         i += len(batch)
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -533,6 +571,8 @@ def main() -> int:
         )
 
     export_txt(conn)
+    log(f"probe done good={good_count(conn)} tested={tested} added={added}")
+    verify_goods(conn)
     log(f"done good={good_count(conn)} tested={tested} added={added}")
     return 0
 

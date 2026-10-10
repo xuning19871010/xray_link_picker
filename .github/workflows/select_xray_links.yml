@@ -36,8 +36,9 @@ jobs:
       - name: select links
         env:
           PYTHONUNBUFFERED: "1"
-          WORKERS_MAX: "32"
-          WORKERS_MIN: "4"
+          WORKERS_MAX: "384"
+          WORKERS_MIN: "256"
+          TARGET_GOOD: "2000"
           PROGRESS_FILE: data/progress.txt
         run: |
           set -e
