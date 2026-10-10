@@ -1,0 +1,37 @@
+name: select_xray_links
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl unzip python3
+          curl -fsSL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
+          sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/xray
+          python3 -V
+      - name: select links
+        env:
+          PYTHONUNBUFFERED: "1"
+          WORKERS_MAX: "32"
+          WORKERS_MIN: "4"
+        run: python3 -u select_links.py
+      - name: commit results
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && echo "no changes" && exit 0
+          git commit -m "update selected xray links"
+          git push
