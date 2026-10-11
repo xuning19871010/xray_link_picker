@@ -9,8 +9,26 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
+
+      # 从本仓（xuning）上一份 Artifact 恢复 sqlite；不进 git，也不双推
+      - name: restore state.sqlite artifact
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p data
+          AID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-sqlite&per_page=5" \
+            --jq '[.artifacts[] | select(.expired==false)][0].id // empty')
+          if [ -z "$AID" ]; then echo "no prior state artifact"; exit 0; fi
+          echo "restoring artifact id=$AID"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$AID/zip" > /tmp/state.zip
+          unzip -o /tmp/state.zip -d data
+          ls -la data/state.sqlite || true
+
       - name: setup
         run: |
           set -e
@@ -33,6 +51,7 @@ jobs:
           echo "CF_SSH_URL=$URL"
           echo "CF_SSH_HOST=${URL#https://}"
           echo "pass: runnerdebug"
+
       - name: select links
         env:
           PYTHONUNBUFFERED: "1"
@@ -55,12 +74,24 @@ jobs:
             sleep 45
           done
           wait $PID
+
+      # sqlite 只上传 Artifact（单仓 xuning），不进 git
+      - name: upload state.sqlite artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-sqlite
+          path: data/state.sqlite
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: commit results
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/
+          # 只提交 txt 等文本结果；sqlite 已 gitignore
+          git add data/*.txt data/.gitkeep 2>/dev/null || git add data/
           git diff --cached --quiet && echo no_changes && exit 0
           git commit -m "update selected xray links"
           git push
