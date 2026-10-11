@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Fetch share links, test via xray on Actions runner, persist good/failed sets."""
+"""选可用 xray 分享链接（Actions runner 上跑）。
+
+两份结果：
+  data/good_links.txt   — 当次测通 + 出口 IP 不重复
+  data/stable_links.txt — 跨天持续通：第N天要 ok_days≥N，满 STABLE_DAYS 后固定要满天数
+
+调试时把 TARGET_GOOD / DEBUG_MAX_CANDIDATES 调小，几分钟就能跑完一轮。
+"""
 from __future__ import annotations
 
 import base64
@@ -14,24 +21,31 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from pathlib import Path
 
+from link_parse import parse_outbound
+
+# ---------- 路径与参数（可用环境变量覆盖）----------
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DB = DATA / "state.sqlite"
-GOOD_TXT = DATA / "good_links.txt"
+GOOD_TXT = DATA / "good_links.txt"       # 当次 good
 FAILED_TXT = DATA / "failed_links.txt"
-TARGET = int(os.environ.get("TARGET_GOOD", "2000"))
-PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
-XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
-TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
+STABLE_TXT = DATA / "stable_links.txt"   # 持续可用
+PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
+
+TARGET = int(os.environ.get("TARGET_GOOD", "50"))          # 调试默认 50；正式可改 2000
+STABLE_DAYS = int(os.environ.get("STABLE_DAYS", "30"))     # 满多少个成功跑日算 stable
 WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "384"))
 WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "256"))
-PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
+TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
+PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
+XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
+# 调试：只测前 N 条候选（0=不限制）。快速验证流程用 300～1000。
+DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "800"))
 
 SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
@@ -54,15 +68,14 @@ SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
     "https://raw.githubusercontent.com/w1770946466/Auto_proxy/main/Long_term_subscription_num",
 ]
-
 IP_URLS = [
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
     "https://icanhazip.com",
     "https://ident.me",
 ]
-
 LINK_RE = re.compile(r"(?:vmess|vless|trojan|ss)://[^\s<>\"']+")
+
 _lock = threading.Lock()
 _port_lock = threading.Lock()
 _next_port = 20000
@@ -82,22 +95,21 @@ def link_hash(link: str) -> str:
     return hashlib.sha256(link.strip().encode()).hexdigest()
 
 
+# ---------- 拉订阅 ----------
 def http_get(url: str, timeout: float = 20, proxy: str | None = None) -> bytes:
-    # Direct fetches use urllib; proxied fetches must use curl (urllib needs PySocks for SOCKS).
+    """直连用 urllib；走 SOCKS 必须用 curl（系统 urllib 不带 SOCKS）。"""
     if not proxy:
         req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
-    # proxy like socks5h://127.0.0.1:PORT
     hostport = proxy.split("://", 1)[-1]
     cmd = [
         "curl", "-fsS", "--max-time", str(int(timeout)),
-        "--socks5-hostname", hostport,
-        "-A", "curl/8.0", url,
+        "--socks5-hostname", hostport, "-A", "curl/8.0", url,
     ]
     r = subprocess.run(cmd, capture_output=True, timeout=timeout + 2)
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.decode(errors="ignore")[:200] or f"curl exit {r.returncode}")
+        raise RuntimeError(r.stderr.decode(errors="ignore")[:200] or f"curl {r.returncode}")
     return r.stdout
 
 
@@ -132,21 +144,35 @@ def fetch_candidates() -> list[str]:
                 out.append(link)
         log(f"fetched {url} total_unique={len(out)}")
     random.shuffle(out)
+    if DEBUG_MAX_CANDIDATES > 0:
+        out = out[:DEBUG_MAX_CANDIDATES]
+        log(f"debug truncate candidates={len(out)}")
     return out
 
 
+# ---------- 数据库 ----------
 def db_connect() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB, check_same_thread=False)
+    # status: good=当次可用 failed=当次失败
+    # ok_days: 跨天累计成功跑日数；last_ok_day: 最近一次成功日期 YYYY-MM-DD
     conn.execute(
         """CREATE TABLE IF NOT EXISTS links(
             h TEXT PRIMARY KEY,
             link TEXT NOT NULL,
             status TEXT NOT NULL,
             exit_ip TEXT,
+            ok_days INTEGER NOT NULL DEFAULT 0,
+            last_ok_day TEXT,
             updated_at REAL NOT NULL
         )"""
     )
+    # 旧库升级：缺列就补
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(links)")}
+    if "ok_days" not in cols:
+        conn.execute("ALTER TABLE links ADD COLUMN ok_days INTEGER NOT NULL DEFAULT 0")
+    if "last_ok_day" not in cols:
+        conn.execute("ALTER TABLE links ADD COLUMN last_ok_day TEXT")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_ip ON links(exit_ip) WHERE exit_ip IS NOT NULL AND status='good'"
     )
@@ -154,40 +180,98 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
-def load_txt_into_db(conn: sqlite3.Connection) -> None:
-    now = time.time()
-    for path, status in ((GOOD_TXT, "good"), (FAILED_TXT, "failed")):
-        if not path.exists():
-            continue
-        for line in path.read_text(errors="ignore").splitlines():
-            link = line.strip()
-            if not link or link.startswith("#"):
-                continue
-            h = link_hash(link)
-            conn.execute(
-                "INSERT OR IGNORE INTO links(h,link,status,exit_ip,updated_at) VALUES(?,?,?,?,?)",
-                (h, link, status, None, now),
-            )
-    conn.commit()
+def stable_threshold(conn: sqlite3.Connection) -> int:
+    """第 N 天门槛=N，直到 STABLE_DAYS；可调 STABLE_DAYS。"""
+    row = conn.execute(
+        "SELECT MIN(last_ok_day) FROM links WHERE last_ok_day IS NOT NULL"
+    ).fetchone()
+    if not row or not row[0]:
+        return 1
+    try:
+        first = date.fromisoformat(row[0])
+    except ValueError:
+        return 1
+    days = (date.today() - first).days + 1
+    return max(1, min(STABLE_DAYS, days))
 
 
 def export_txt(conn: sqlite3.Connection) -> None:
-    goods = [
-        r[0]
-        for r in conn.execute(
-            "SELECT link FROM links WHERE status='good' ORDER BY updated_at"
-        )
-    ]
-    fails = [
-        r[0]
-        for r in conn.execute(
-            "SELECT link FROM links WHERE status='failed' ORDER BY updated_at"
-        )
-    ]
+    goods = [r[0] for r in conn.execute(
+        "SELECT link FROM links WHERE status='good' ORDER BY updated_at")]
+    fails = [r[0] for r in conn.execute(
+        "SELECT link FROM links WHERE status='failed' ORDER BY updated_at")]
+    need = stable_threshold(conn)
+    # 刚起步：第1天 ok_days>=1 即入 stable；逐渐升到 STABLE_DAYS
+    stables = [r[0] for r in conn.execute(
+        "SELECT link FROM links WHERE ok_days>=? ORDER BY ok_days DESC, updated_at",
+        (need,),
+    )]
     GOOD_TXT.write_text("\n".join(goods) + ("\n" if goods else ""))
     FAILED_TXT.write_text("\n".join(fails) + ("\n" if fails else ""))
+    STABLE_TXT.write_text("\n".join(stables) + ("\n" if stables else ""))
+    log(f"export good={len(goods)} failed={len(fails)} stable={len(stables)} (need ok_days>={need}, cap={STABLE_DAYS})")
 
 
+def good_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM links WHERE status='good'").fetchone()[0]
+
+
+def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) -> bool:
+    """记当次结果。good 且 IP 未占用返回 True；IP 重复则记 failed 返回 False。"""
+    h = link_hash(link)
+    now = time.time()
+    today = date.today().isoformat()
+    with _lock:
+        if status == "good":
+            if exit_ip:
+                row = conn.execute(
+                    "SELECT 1 FROM links WHERE exit_ip=? AND status='good' AND h!=?",
+                    (exit_ip, h),
+                ).fetchone()
+                if row:
+                    prev = conn.execute(
+                        "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
+                    ).fetchone()
+                    ok_days = (prev[0] if prev else 0) or 0
+                    last = prev[1] if prev else None
+                    conn.execute(
+                        "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (h, link, "failed", None, ok_days, last, now),
+                    )
+                    conn.commit()
+                    return False
+            # 跨天：同一天只加一次 ok_days
+            prev = conn.execute(
+                "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
+            ).fetchone()
+            ok_days = (prev[0] if prev else 0) or 0
+            last = prev[1] if prev else None
+            if last != today:
+                ok_days += 1
+                last = today
+            conn.execute(
+                "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (h, link, "good", exit_ip, ok_days, last, now),
+            )
+            conn.commit()
+            return True
+        prev = conn.execute(
+            "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
+        ).fetchone()
+        ok_days = (prev[0] if prev else 0) or 0
+        last = prev[1] if prev else None
+        conn.execute(
+            "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (h, link, "failed", None, ok_days, last, now),
+        )
+        conn.commit()
+        return False
+
+
+# ---------- 探针 ----------
 def alloc_port() -> int:
     global _next_port
     with _port_lock:
@@ -198,180 +282,22 @@ def alloc_port() -> int:
         return p
 
 
-def parse_outbound(link: str) -> dict | None:
-    try:
-        if link.startswith("vmess://"):
-            raw = link[8:]
-            pad = "=" * (-len(raw) % 4)
-            cfg = json.loads(base64.b64decode(raw + pad))
-            host = cfg.get("add") or cfg.get("host")
-            port = int(cfg.get("port", 0))
-            uuid = cfg.get("id")
-            if not host or not port or not uuid:
-                return None
-            net = cfg.get("net") or "tcp"
-            tls = cfg.get("tls") or ""
-            stream: dict = {"network": net}
-            if net == "ws":
-                stream["wsSettings"] = {
-                    "path": cfg.get("path") or "/",
-                    "headers": {"Host": cfg.get("host") or host},
-                }
-            elif net == "grpc":
-                stream["grpcSettings"] = {"serviceName": cfg.get("path") or ""}
-            if tls == "tls":
-                stream["security"] = "tls"
-                stream["tlsSettings"] = {
-                    "serverName": cfg.get("sni") or cfg.get("host") or host,
-                    "allowInsecure": True,
-                }
-            else:
-                stream["security"] = "none"
-            return {
-                "protocol": "vmess",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": host,
-                            "port": port,
-                            "users": [
-                                {
-                                    "id": uuid,
-                                    "alterId": int(cfg.get("aid") or 0),
-                                    "security": cfg.get("scy") or "auto",
-                                }
-                            ],
-                        }
-                    ]
-                },
-                "streamSettings": stream,
-            }
-        if link.startswith("vless://"):
-            u = urllib.parse.urlparse(link)
-            uuid = urllib.parse.unquote(u.username or "")
-            host = u.hostname
-            port = u.port or 443
-            q = urllib.parse.parse_qs(u.query)
-            if not uuid or not host:
-                return None
-            net = (q.get("type") or ["tcp"])[0]
-            security = (q.get("security") or ["none"])[0]
-            stream = {"network": net, "security": security}
-            if net == "ws":
-                stream["wsSettings"] = {
-                    "path": (q.get("path") or ["/"])[0],
-                    "headers": {"Host": (q.get("host") or [host])[0]},
-                }
-            if security in ("tls", "reality"):
-                key = "tlsSettings" if security == "tls" else "realitySettings"
-                stream[key] = {
-                    "serverName": (q.get("sni") or [host])[0],
-                    "fingerprint": (q.get("fp") or ["chrome"])[0],
-                }
-                if security == "reality":
-                    stream[key]["publicKey"] = (q.get("pbk") or [""])[0]
-                    stream[key]["shortId"] = (q.get("sid") or [""])[0]
-            return {
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": host,
-                            "port": port,
-                            "users": [
-                                {
-                                    "id": uuid,
-                                    "encryption": "none",
-                                    "flow": (q.get("flow") or [""])[0],
-                                }
-                            ],
-                        }
-                    ]
-                },
-                "streamSettings": stream,
-            }
-        if link.startswith("trojan://"):
-            u = urllib.parse.urlparse(link)
-            password = urllib.parse.unquote(u.username or "")
-            host = u.hostname
-            port = u.port or 443
-            q = urllib.parse.parse_qs(u.query)
-            if not password or not host:
-                return None
-            net = (q.get("type") or ["tcp"])[0]
-            stream = {"network": net, "security": "tls", "tlsSettings": {"serverName": (q.get("sni") or [host])[0], "allowInsecure": True}}
-            if net == "ws":
-                stream["wsSettings"] = {
-                    "path": (q.get("path") or ["/"])[0],
-                    "headers": {"Host": (q.get("host") or [host])[0]},
-                }
-            return {
-                "protocol": "trojan",
-                "settings": {"servers": [{"address": host, "port": port, "password": password}]},
-                "streamSettings": stream,
-            }
-        if link.startswith("ss://"):
-            rest = link[5:]
-            if "#" in rest:
-                rest = rest.split("#", 1)[0]
-            if "@" not in rest:
-                pad = "=" * (-len(rest) % 4)
-                rest = base64.b64decode(rest + pad).decode() + "@IGNORE"
-                # format method:pass@host:port after decode sometimes
-                if "@" not in rest:
-                    return None
-            userinfo, hostport = rest.rsplit("@", 1)
-            if ":" not in hostport:
-                return None
-            host, port_s = hostport.rsplit(":", 1)
-            port = int(port_s)
-            if ":" in userinfo and not userinfo.startswith("ey"):
-                method, password = userinfo.split(":", 1)
-                password = urllib.parse.unquote(password)
-            else:
-                pad = "=" * (-len(userinfo) % 4)
-                dec = base64.b64decode(userinfo + pad).decode()
-                method, password = dec.split(":", 1)
-            return {
-                "protocol": "shadowsocks",
-                "settings": {
-                    "servers": [
-                        {
-                            "address": host,
-                            "port": port,
-                            "method": method,
-                            "password": password,
-                        }
-                    ]
-                },
-            }
-    except Exception:
-        return None
-    return None
-
-
 def write_xray_cfg(path: Path, outbound: dict, socks_port: int) -> None:
-    cfg = {
+    path.write_text(json.dumps({
         "log": {"loglevel": "none"},
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": socks_port,
-                "protocol": "socks",
-                "settings": {"udp": False},
-            }
-        ],
+        "inbounds": [{
+            "listen": "127.0.0.1", "port": socks_port,
+            "protocol": "socks", "settings": {"udp": False},
+        }],
         "outbounds": [outbound],
-    }
-    path.write_text(json.dumps(cfg))
+    }))
 
 
 def cpu_busy() -> float:
     try:
         with open("/proc/loadavg") as f:
             load1 = float(f.read().split()[0])
-        cpus = os.cpu_count() or 2
-        return load1 / cpus
+        return load1 / (os.cpu_count() or 2)
     except Exception:
         return 0.5
 
@@ -388,7 +314,7 @@ def get_exit_ip(proxy: str) -> str | None:
 
 
 def probe(link: str) -> tuple[str, str | None, str]:
-    """returns status, exit_ip, reason"""
+    """测一条链接：通探针 + 能取到出口 IP 才算 good。"""
     outbound = parse_outbound(link)
     if not outbound:
         return "failed", None, "parse"
@@ -399,8 +325,7 @@ def probe(link: str) -> tuple[str, str | None, str]:
     try:
         proc = subprocess.Popen(
             [XRAY_BIN, "run", "-config", str(cfg_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         time.sleep(float(os.environ.get("XRAY_WARMUP", "0.15")))
         proxy = f"socks5h://127.0.0.1:{socks_port}"
@@ -424,57 +349,14 @@ def probe(link: str) -> tuple[str, str | None, str]:
             pass
 
 
-def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) -> bool:
-    """Return True if newly recorded as good."""
-    h = link_hash(link)
-    now = time.time()
-    with _lock:
-        if status == "good":
-            if exit_ip:
-                row = conn.execute(
-                    "SELECT 1 FROM links WHERE exit_ip=? AND status='good'",
-                    (exit_ip,),
-                ).fetchone()
-                if row:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO links(h,link,status,exit_ip,updated_at) VALUES(?,?,?,?,?)",
-                        (h, link, "failed", None, now),
-                    )
-                    conn.commit()
-                    return False
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO links(h,link,status,exit_ip,updated_at) VALUES(?,?,?,?,?)",
-                    (h, link, "good", exit_ip, now),
-                )
-                conn.commit()
-                return True
-            except sqlite3.IntegrityError:
-                conn.execute(
-                    "INSERT OR REPLACE INTO links(h,link,status,exit_ip,updated_at) VALUES(?,?,?,?,?)",
-                    (h, link, "failed", None, now),
-                )
-                conn.commit()
-                return False
-        else:
-            conn.execute(
-                "INSERT OR REPLACE INTO links(h,link,status,exit_ip,updated_at) VALUES(?,?,?,?,?)",
-                (h, link, "failed", None, now),
-            )
-            conn.commit()
-            return False
-
-
-
 def verify_goods(conn: sqlite3.Connection) -> None:
-    """Re-probe all good links; drop dead or duplicate exit IPs."""
+    """收尾复验：再测一遍 good，踢掉不通或 IP 撞车的。"""
     rows = conn.execute(
         "SELECT link, exit_ip FROM links WHERE status='good' ORDER BY updated_at"
     ).fetchall()
     log(f"verify start count={len(rows)}")
     seen: set[str] = set()
-    keep = 0
-    drop = 0
+    keep = drop = 0
     with ThreadPoolExecutor(max_workers=min(64, max(8, WORKERS_MAX // 2))) as ex:
         futs = {ex.submit(probe, link): (link, old_ip) for link, old_ip in rows}
         for fut in as_completed(futs):
@@ -483,18 +365,12 @@ def verify_goods(conn: sqlite3.Connection) -> None:
                 status, ip, reason = fut.result()
             except Exception:
                 status, ip, reason = "failed", None, "exc"
-            if status != "good" or not ip:
+            if status != "good" or not ip or ip in seen:
                 mark(conn, link, "failed", None)
                 drop += 1
-                log(f"VERIFY_DROP reason={reason} old_ip={old_ip}")
-                continue
-            if ip in seen:
-                mark(conn, link, "failed", None)
-                drop += 1
-                log(f"VERIFY_DUP ip={ip}")
+                log(f"VERIFY_DROP reason={reason or 'dup'} old_ip={old_ip}")
                 continue
             seen.add(ip)
-            # refresh ip if changed
             if ip != old_ip:
                 mark(conn, link, "good", ip)
             keep += 1
@@ -502,41 +378,30 @@ def verify_goods(conn: sqlite3.Connection) -> None:
     log(f"verify done keep={keep} drop={drop} unique_ip={len(seen)}")
 
 
-def good_count(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM links WHERE status='good'").fetchone()[0]
-
-
+# ---------- 主流程 ----------
 def main() -> int:
     DATA.mkdir(parents=True, exist_ok=True)
     conn = db_connect()
-    load_txt_into_db(conn)
     start_good = good_count(conn)
-    log(f"start good={start_good} target={TARGET}")
+    log(f"start good={start_good} target={TARGET} stable_days={STABLE_DAYS}")
     log(f"xray_bin={XRAY_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
     if start_good >= TARGET:
-        log("already enough")
-        export_txt(conn)
+        log("already enough — still verify + export")
+        verify_goods(conn)
         return 0
 
     candidates = fetch_candidates()
-    skip = {
-        r[0]
-        for r in conn.execute("SELECT h FROM links WHERE status IN ('good','failed')")
-    }
+    skip = {r[0] for r in conn.execute(
+        "SELECT h FROM links WHERE status IN ('good','failed')")}
     todo = [c for c in candidates if link_hash(c) not in skip]
     log(f"candidates={len(candidates)} todo={len(todo)}")
 
     workers = WORKERS_MAX
-    tested = 0
-    added = 0
-    flush_every = 50
+    tested = added = 0
     since_flush = 0
-
     i = 0
     while i < len(todo) and good_count(conn) < TARGET:
-        # adaptive workers
         busy = cpu_busy()
-        # network-bound: keep concurrency high; only ease off under severe load
         if busy > 3.0:
             workers = max(WORKERS_MIN, workers - 8)
         elif busy < 1.0:
@@ -561,13 +426,14 @@ def main() -> int:
                         log(f"DUP_IP ip={ip}")
                 else:
                     mark(conn, link, "failed", None)
-                if since_flush >= flush_every:
+                if since_flush >= 50:
                     export_txt(conn)
                     since_flush = 0
                 if good_count(conn) >= TARGET:
                     break
         log(
-            f"progress tested={tested} added={added} good={good_count(conn)} workers={workers} load={busy:.2f}"
+            f"progress tested={tested} added={added} good={good_count(conn)} "
+            f"workers={workers} load={busy:.2f}"
         )
 
     export_txt(conn)

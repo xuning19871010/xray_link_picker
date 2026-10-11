@@ -38,7 +38,8 @@ jobs:
           PYTHONUNBUFFERED: "1"
           WORKERS_MAX: "384"
           WORKERS_MIN: "256"
-          TARGET_GOOD: "2000"
+          TARGET_GOOD: "50"
+          DEBUG_MAX_CANDIDATES: "800"
           PROGRESS_FILE: data/progress.txt
         run: |
           set -e
