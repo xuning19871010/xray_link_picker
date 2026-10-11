@@ -3,9 +3,10 @@
 
 两份结果：
   data/good_links.txt   — 当次测通 + 出口 IP 不重复
-  data/stable_links.txt — 跨天持续通：第N天要 ok_days≥N，满 STABLE_DAYS 后固定要满天数
+  data/stable_links.txt — 连续成功跑日 streak（中途任一天不通就清零）；
+                          门槛随开跑天数爬升到 STABLE_DAYS（可调）
 
-调试时把 TARGET_GOOD / DEBUG_MAX_CANDIDATES 调小，几分钟就能跑完一轮。
+TARGET_GOOD=0 表示不设上限，把候选测完拿多少算多少。
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from link_parse import parse_outbound
@@ -37,15 +38,15 @@ FAILED_TXT = DATA / "failed_links.txt"
 STABLE_TXT = DATA / "stable_links.txt"   # 持续可用
 PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
 
-TARGET = int(os.environ.get("TARGET_GOOD", "50"))          # 调试默认 50；正式可改 2000
-STABLE_DAYS = int(os.environ.get("STABLE_DAYS", "30"))     # 满多少个成功跑日算 stable
+TARGET = int(os.environ.get("TARGET_GOOD", "0"))           # 0=不设上限，测完为止
+STABLE_DAYS = int(os.environ.get("STABLE_DAYS", "30"))     # streak 满多少天算「满额」stable
 WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "384"))
 WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "256"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
 PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
 XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
 # 调试：只测前 N 条候选（0=不限制）。快速验证流程用 300～1000。
-DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "800"))
+DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "0"))  # 0=不截断
 
 SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
@@ -67,6 +68,10 @@ SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/Leon406/SubCrawler/main/sub/share/v2",
     "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
     "https://raw.githubusercontent.com/w1770946466/Auto_proxy/main/Long_term_subscription_num",
+    "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs_base64.txt",
+    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/super-sub.txt",
+    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/All_Configs_Sub.txt",
 ]
 IP_URLS = [
     "https://api.ipify.org",
@@ -241,14 +246,20 @@ def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) 
                     )
                     conn.commit()
                     return False
-            # 跨天：同一天只加一次 ok_days
+            # 连续成功日 streak：断一天就从 1 重计；当天重复测不加
             prev = conn.execute(
                 "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
             ).fetchone()
             ok_days = (prev[0] if prev else 0) or 0
             last = prev[1] if prev else None
-            if last != today:
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            if last == today:
+                pass
+            elif last == yesterday:
                 ok_days += 1
+                last = today
+            else:
+                ok_days = 1
                 last = today
             conn.execute(
                 "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
@@ -257,15 +268,11 @@ def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) 
             )
             conn.commit()
             return True
-        prev = conn.execute(
-            "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
-        ).fetchone()
-        ok_days = (prev[0] if prev else 0) or 0
-        last = prev[1] if prev else None
+        # 任一次不通：streak 清零（30 天窗口内有一次不通即出局）
         conn.execute(
             "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
             "VALUES(?,?,?,?,?,?,?)",
-            (h, link, "failed", None, ok_days, last, now),
+            (h, link, "failed", None, 0, None, now),
         )
         conn.commit()
         return False
@@ -385,10 +392,31 @@ def main() -> int:
     start_good = good_count(conn)
     log(f"start good={start_good} target={TARGET} stable_days={STABLE_DAYS}")
     log(f"xray_bin={XRAY_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
-    if start_good >= TARGET:
+    if TARGET > 0 and start_good >= TARGET:
         log("already enough — still verify + export")
         verify_goods(conn)
         return 0
+
+    # 先复测昨天的 good：不通则清 streak（满足「有一次不通就算不通」）
+    old_goods = [r[0] for r in conn.execute(
+        "SELECT link FROM links WHERE status='good'")]
+    if old_goods:
+        log(f"retest previous goods={len(old_goods)}")
+        with ThreadPoolExecutor(max_workers=min(64, WORKERS_MAX)) as ex:
+            futs = {ex.submit(probe, link): link for link in old_goods}
+            for fut in as_completed(futs):
+                link = futs[fut]
+                try:
+                    status, ip, reason = fut.result()
+                except Exception:
+                    status, ip, reason = "failed", None, "exc"
+                if status == "good" and ip:
+                    if not mark(conn, link, "good", ip):
+                        log(f"RETEST_DUP ip={ip}")
+                else:
+                    mark(conn, link, "failed", None)
+                    log(f"RETEST_FAIL reason={reason}")
+        export_txt(conn)
 
     candidates = fetch_candidates()
     skip = {r[0] for r in conn.execute(
@@ -400,7 +428,7 @@ def main() -> int:
     tested = added = 0
     since_flush = 0
     i = 0
-    while i < len(todo) and good_count(conn) < TARGET:
+    while i < len(todo) and (TARGET <= 0 or good_count(conn) < TARGET):
         busy = cpu_busy()
         if busy > 3.0:
             workers = max(WORKERS_MIN, workers - 8)
@@ -429,7 +457,7 @@ def main() -> int:
                 if since_flush >= 50:
                     export_txt(conn)
                     since_flush = 0
-                if good_count(conn) >= TARGET:
+                if TARGET > 0 and good_count(conn) >= TARGET:
                     break
         log(
             f"progress tested={tested} added={added} good={good_count(conn)} "

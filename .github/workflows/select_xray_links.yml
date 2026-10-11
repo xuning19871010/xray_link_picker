@@ -1,6 +1,7 @@
 name: select_xray_links
 on:
   workflow_dispatch:
+  # GitHub cron 只能固定时刻；真正「每天随机时段」由 dig 上的 routine 触发 workflow_dispatch
   schedule:
     - cron: "0 20 * * *"
 jobs:
@@ -57,8 +58,8 @@ jobs:
           PYTHONUNBUFFERED: "1"
           WORKERS_MAX: "384"
           WORKERS_MIN: "256"
-          TARGET_GOOD: "50"
-          DEBUG_MAX_CANDIDATES: "800"
+          TARGET_GOOD: "0"
+          DEBUG_MAX_CANDIDATES: "0"
           PROGRESS_FILE: data/progress.txt
         run: |
           set -e
