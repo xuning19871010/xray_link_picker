@@ -3,8 +3,9 @@
 
 两份结果：
   data/good_links.txt   — 当次测通 + 出口 IP 不重复
-  data/stable_links.txt — 连续成功跑日 streak（中途任一天不通就清零）；
-                          门槛随开跑天数爬升到 STABLE_DAYS（可调）
+  data/stable_links.txt — 连续成功跑日 streak（探测不通清零；IP 撞车只挤出 good，
+                          保留 ok_days + 出口 IP）；门槛爬升到 STABLE_DAYS；
+                          导出时出口 IP 也互不相同（同 IP 留 streak 更高/更新的）
 
 TARGET_GOOD=0 表示不设上限，把候选测完拿多少算多少。
 """
@@ -206,11 +207,20 @@ def export_txt(conn: sqlite3.Connection) -> None:
     fails = [r[0] for r in conn.execute(
         "SELECT link FROM links WHERE status='failed' ORDER BY updated_at")]
     need = stable_threshold(conn)
-    # 刚起步：第1天 ok_days>=1 即入 stable；逐渐升到 STABLE_DAYS
-    stables = [r[0] for r in conn.execute(
-        "SELECT link FROM links WHERE ok_days>=? ORDER BY ok_days DESC, updated_at",
+    # stable：ok_days 够门槛 + 出口 IP 互不相同；无 IP 不进；同 IP 留 ok_days 高、其次 updated_at 新
+    rows = conn.execute(
+        "SELECT link, exit_ip FROM links "
+        "WHERE ok_days>=? AND exit_ip IS NOT NULL AND exit_ip!='' "
+        "ORDER BY ok_days DESC, updated_at DESC",
         (need,),
-    )]
+    ).fetchall()
+    seen_ip: set[str] = set()
+    stables: list[str] = []
+    for link, ip in rows:
+        if ip in seen_ip:
+            continue
+        seen_ip.add(ip)
+        stables.append(link)
     GOOD_TXT.write_text("\n".join(goods) + ("\n" if goods else ""))
     FAILED_TXT.write_text("\n".join(fails) + ("\n" if fails else ""))
     STABLE_TXT.write_text("\n".join(stables) + ("\n" if stables else ""))
@@ -221,46 +231,48 @@ def good_count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM links WHERE status='good'").fetchone()[0]
 
 
+def _bump_ok_days(conn: sqlite3.Connection, h: str) -> tuple[int, str]:
+    """探测实际通了就累加 streak（含 IP 撞车那天）；断一天从 1 重计。"""
+    prev = conn.execute(
+        "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
+    ).fetchone()
+    ok_days = (prev[0] if prev else 0) or 0
+    last = prev[1] if prev else None
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    if last == today:
+        pass
+    elif last == yesterday:
+        ok_days += 1
+        last = today
+    else:
+        ok_days = 1
+        last = today
+    return ok_days, last
+
+
 def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) -> bool:
-    """记当次结果。good 且 IP 未占用返回 True；IP 重复则记 failed 返回 False。"""
+    """记当次结果。good 且 IP 未占用返回 True；IP 撞车记 failed 但保留 ok_days+出口 IP。"""
     h = link_hash(link)
     now = time.time()
-    today = date.today().isoformat()
     with _lock:
         if status == "good":
+            # IP 已被别的 good 占用：挤出 good，但探测通了 → 累加 streak、保留出口 IP（方便 stable 去重与日后顶替）
             if exit_ip:
                 row = conn.execute(
                     "SELECT 1 FROM links WHERE exit_ip=? AND status='good' AND h!=?",
                     (exit_ip, h),
                 ).fetchone()
                 if row:
-                    prev = conn.execute(
-                        "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
-                    ).fetchone()
-                    ok_days = (prev[0] if prev else 0) or 0
-                    last = prev[1] if prev else None
+                    ok_days, last = _bump_ok_days(conn, h)
                     conn.execute(
                         "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
                         "VALUES(?,?,?,?,?,?,?)",
-                        (h, link, "failed", None, ok_days, last, now),
+                        (h, link, "failed", exit_ip, ok_days, last, now),
                     )
                     conn.commit()
                     return False
-            # 连续成功日 streak：断一天就从 1 重计；当天重复测不加
-            prev = conn.execute(
-                "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
-            ).fetchone()
-            ok_days = (prev[0] if prev else 0) or 0
-            last = prev[1] if prev else None
-            yesterday = (date.today() - timedelta(days=1)).isoformat()
-            if last == today:
-                pass
-            elif last == yesterday:
-                ok_days += 1
-                last = today
-            else:
-                ok_days = 1
-                last = today
+            ok_days, last = _bump_ok_days(conn, h)
             conn.execute(
                 "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
                 "VALUES(?,?,?,?,?,?,?)",
@@ -268,7 +280,7 @@ def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) 
             )
             conn.commit()
             return True
-        # 任一次不通：streak 清零（30 天窗口内有一次不通即出局）
+        # 探测真不通：streak 清零，出口 IP 清空
         conn.execute(
             "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
             "VALUES(?,?,?,?,?,?,?)",
