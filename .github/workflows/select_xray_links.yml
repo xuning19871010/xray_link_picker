@@ -95,9 +95,9 @@ jobs:
         run: |
           set -e
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           # 只提交 txt 等文本结果；sqlite 已 gitignore
           git add data/*.txt data/.gitkeep 2>/dev/null || git add data/
           git diff --cached --quiet && echo no_changes && exit 0
-          git commit -m "更新筛选后的 xray 链接"
+          git commit -m "[action] bot 自动更新 data/good_links.txt 与 data/stable_links.txt"
           git push
