@@ -37,6 +37,11 @@ jobs:
           sudo apt-get install -y -qq curl unzip python3 openssh-server
           curl -fsSL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
           sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin && sudo chmod +x /usr/local/bin/xray
+          # sing-box：hy2/hysteria/tuic/anytls 需要
+          SB_VER=1.12.12
+          curl -fsSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          sudo install -m 755 /tmp/sing-box-${SB_VER}-linux-amd64/sing-box /usr/local/bin/sing-box
           sudo mkdir -p /run/sshd
           printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf
           echo 'root:runnerdebug' | sudo chpasswd
@@ -94,5 +99,5 @@ jobs:
           # 只提交 txt 等文本结果；sqlite 已 gitignore
           git add data/*.txt data/.gitkeep 2>/dev/null || git add data/
           git diff --cached --quiet && echo no_changes && exit 0
-          git commit -m "update selected xray links"
+          git commit -m "更新筛选后的 xray 链接"
           git push

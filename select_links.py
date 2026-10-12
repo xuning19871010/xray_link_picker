@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
-from link_parse import parse_outbound
+from link_parse import parse_link
 
 # ---------- 路径与参数（可用环境变量覆盖）----------
 ROOT = Path(__file__).resolve().parent
@@ -46,6 +46,7 @@ WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "256"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
 PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
 XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
+SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
 # 调试：只测前 N 条候选（0=不限制）。快速验证流程用 300～1000。
 DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "0"))  # 0=不截断
 
@@ -80,7 +81,10 @@ IP_URLS = [
     "https://icanhazip.com",
     "https://ident.me",
 ]
-LINK_RE = re.compile(r"(?:vmess|vless|trojan|ss)://[^\s<>\"']+")
+LINK_RE = re.compile(
+    r"(?:vmess|vless|trojan|ss|ssr|hysteria2|hy2|hysteria|tuic|anytls|"
+    r"wireguard|socks5|socks|https|http)://[^\s<>\"']+"
+)
 
 _lock = threading.Lock()
 _port_lock = threading.Lock()
@@ -312,6 +316,19 @@ def write_xray_cfg(path: Path, outbound: dict, socks_port: int) -> None:
     }))
 
 
+def write_singbox_cfg(path: Path, outbound: dict, socks_port: int) -> None:
+    ob = dict(outbound)
+    ob.setdefault("tag", "proxy")
+    path.write_text(json.dumps({
+        "log": {"level": "panic"},
+        "inbounds": [{
+            "type": "socks", "tag": "in",
+            "listen": "127.0.0.1", "listen_port": socks_port,
+        }],
+        "outbounds": [ob],
+    }))
+
+
 def cpu_busy() -> float:
     try:
         with open("/proc/loadavg") as f:
@@ -333,19 +350,24 @@ def get_exit_ip(proxy: str) -> str | None:
 
 
 def probe(link: str) -> tuple[str, str | None, str]:
-    """测一条链接：通探针 + 能取到出口 IP 才算 good。"""
-    outbound = parse_outbound(link)
-    if not outbound:
+    """测一条链接：通探针 + 能取到出口 IP 才算 good。按协议选 xray / sing-box。"""
+    parsed = parse_link(link)
+    if not parsed:
         return "failed", None, "parse"
+    engine, outbound = parsed["engine"], parsed["outbound"]
     socks_port = alloc_port()
-    cfg_path = Path(f"/tmp/xray_{socks_port}.json")
-    write_xray_cfg(cfg_path, outbound, socks_port)
+    cfg_path = Path(f"/tmp/probe_{engine}_{socks_port}.json")
+    if engine == "xray":
+        write_xray_cfg(cfg_path, outbound, socks_port)
+        cmd = [XRAY_BIN, "run", "-config", str(cfg_path)]
+    elif engine == "sing-box":
+        write_singbox_cfg(cfg_path, outbound, socks_port)
+        cmd = [SINGBOX_BIN, "run", "-c", str(cfg_path)]
+    else:
+        return "failed", None, "engine"
     proc = None
     try:
-        proc = subprocess.Popen(
-            [XRAY_BIN, "run", "-config", str(cfg_path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(float(os.environ.get("XRAY_WARMUP", "0.15")))
         proxy = f"socks5h://127.0.0.1:{socks_port}"
         try:
@@ -403,7 +425,7 @@ def main() -> int:
     conn = db_connect()
     start_good = good_count(conn)
     log(f"start good={start_good} target={TARGET} stable_days={STABLE_DAYS}")
-    log(f"xray_bin={XRAY_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
+    log(f"xray_bin={XRAY_BIN} singbox_bin={SINGBOX_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
     if TARGET > 0 and start_good >= TARGET:
         log("already enough — still verify + export")
         verify_goods(conn)
@@ -433,8 +455,17 @@ def main() -> int:
     candidates = fetch_candidates()
     skip = {r[0] for r in conn.execute(
         "SELECT h FROM links WHERE status IN ('good','failed')")}
-    todo = [c for c in candidates if link_hash(c) not in skip]
-    log(f"candidates={len(candidates)} todo={len(todo)}")
+    # 跳过无法运行的（ssr/噪声 https 等）：不进 todo，避免永久记 failed
+    todo = []
+    skipped_unrun = 0
+    for c in candidates:
+        if link_hash(c) in skip:
+            continue
+        if not parse_link(c):
+            skipped_unrun += 1
+            continue
+        todo.append(c)
+    log(f"candidates={len(candidates)} todo={len(todo)} skip_unrunnable={skipped_unrun}")
 
     workers = WORKERS_MAX
     tested = added = 0
