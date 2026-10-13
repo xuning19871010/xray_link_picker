@@ -1,9 +1,12 @@
 name: select_xray_links
 on:
   workflow_dispatch:
-  # GitHub cron 只能固定时刻；真正「每天随机时段」由 dig 上的 routine 触发 workflow_dispatch
   schedule:
-    - cron: "0 20 * * *"
+    - cron: "22 * * * *"
+# 每小时触发，上一趟未结束时排队等待，不取消旧的
+concurrency:
+  group: select_xray_links
+  cancel-in-progress: false
 jobs:
   select:
     runs-on: ubuntu-latest
