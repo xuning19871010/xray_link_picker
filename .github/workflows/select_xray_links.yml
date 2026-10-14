@@ -17,14 +17,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 从本仓（xuning）上一份 Artifact 恢复 sqlite；不进 git，也不双推
-      - name: restore state.sqlite artifact
+      # 恢复 sqlite：优先从 Release latest 下载；没有则回退到上一份 Artifact（首次迁移时 ok_days 不断）
+      - name: restore state.sqlite (release, fallback artifact)
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mkdir -p data
+          if gh release download latest -R "${{ github.repository }}" -p state.sqlite -D data --clobber 2>/dev/null; then
+            echo "restored state.sqlite from release latest"
+            ls -la data/state.sqlite
+            exit 0
+          fi
+          echo "release 无 state.sqlite，回退 artifact"
           AID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-sqlite&per_page=5" \
             --jq '[.artifacts[] | select(.expired==false)][0].id // empty')
           if [ -z "$AID" ]; then echo "no prior state artifact"; exit 0; fi
@@ -88,7 +94,7 @@ jobs:
           done
           wait $PID
 
-      # sqlite 只上传 Artifact（单仓 xuning），不进 git
+      # Artifact 保留作备份（30 天）：Release 附件被覆盖坏了时还能回退恢复
       - name: upload state.sqlite artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -98,18 +104,18 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # 结果不再提交进 git：good/stable 覆盖上传到固定 Release（tag latest），仅 xuning 有
+      # 结果不再提交进 git：good/stable/state.sqlite 覆盖上传到固定 Release（tag latest），仅 xuning 有
       - name: publish good/stable to release latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          ls -la data/good_links.txt data/stable_links.txt
+          ls -la data/good_links.txt data/stable_links.txt data/state.sqlite
           NOTE="自动更新于 $(TZ=Asia/Shanghai date '+%F %T') 北京时间；run #${{ github.run_number }}"
           # 首次运行时创建 Release（tag 指向当前提交），之后只覆盖附件
           if ! gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create latest -R "${{ github.repository }}" --target "${{ github.sha }}" \
               --title "latest good/stable links" --notes "$NOTE" --latest
           fi
-          gh release upload latest data/good_links.txt data/stable_links.txt --clobber -R "${{ github.repository }}"
+          gh release upload latest data/good_links.txt data/stable_links.txt data/state.sqlite --clobber -R "${{ github.repository }}"
           gh release edit latest -R "${{ github.repository }}" --notes "$NOTE"
