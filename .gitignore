@@ -1,2 +1,4 @@
 __pycache__/
 data/state.sqlite
+# data 下结果只在 runner 生成，不进 git（good/stable 发布到 Release latest）
+data/*.txt

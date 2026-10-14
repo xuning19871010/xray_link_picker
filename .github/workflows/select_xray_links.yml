@@ -98,13 +98,18 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: commit results
+      # 结果不再提交进 git：good/stable 覆盖上传到固定 Release（tag latest），仅 xuning 有
+      - name: publish good/stable to release latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 只提交 txt 等文本结果；sqlite 已 gitignore
-          git add data/*.txt data/.gitkeep 2>/dev/null || git add data/
-          git diff --cached --quiet && echo no_changes && exit 0
-          git commit -m "[action] bot 自动更新 data/good_links.txt 与 data/stable_links.txt"
-          git push
+          ls -la data/good_links.txt data/stable_links.txt
+          NOTE="自动更新于 $(TZ=Asia/Shanghai date '+%F %T') 北京时间；run #${{ github.run_number }}"
+          # 首次运行时创建 Release（tag 指向当前提交），之后只覆盖附件
+          if ! gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create latest -R "${{ github.repository }}" --target "${{ github.sha }}" \
+              --title "latest good/stable links" --notes "$NOTE" --latest
+          fi
+          gh release upload latest data/good_links.txt data/stable_links.txt --clobber -R "${{ github.repository }}"
+          gh release edit latest -R "${{ github.repository }}" --notes "$NOTE"
