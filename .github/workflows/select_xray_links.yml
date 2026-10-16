@@ -104,18 +104,18 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # 结果不再提交进 git：good/stable/state.sqlite 覆盖上传到固定 Release（tag latest），仅 xuning 有
+      # 结果不再提交进 git：good/stable/stable_by_ip/state.sqlite 覆盖上传到固定 Release（tag latest），仅 xuning 有
       - name: publish good/stable to release latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          ls -la data/good_links.txt data/stable_links.txt data/state.sqlite
+          ls -la data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt data/state.sqlite
           NOTE="自动更新于 $(TZ=Asia/Shanghai date '+%F %T') 北京时间；run #${{ github.run_number }}"
           # 首次运行时创建 Release（tag 指向当前提交），之后只覆盖附件
           if ! gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create latest -R "${{ github.repository }}" --target "${{ github.sha }}" \
               --title "latest good/stable links" --notes "$NOTE" --latest
           fi
-          gh release upload latest data/good_links.txt data/stable_links.txt data/state.sqlite --clobber -R "${{ github.repository }}"
+          gh release upload latest data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt data/state.sqlite --clobber -R "${{ github.repository }}"
           gh release edit latest -R "${{ github.repository }}" --notes "$NOTE"

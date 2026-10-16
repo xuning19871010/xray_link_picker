@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """选可用 xray 分享链接（Actions runner 上跑）。
 
-两份结果：
-  data/good_links.txt   — 当次测通 + 出口 IP 不重复
-  data/stable_links.txt — 连续成功跑日 streak（探测不通清零；IP 撞车只挤出 good，
-                          保留 ok_days + 出口 IP）；门槛爬升到 STABLE_DAYS；
-                          导出时出口 IP 也互不相同（同 IP 留 streak 更高/更新的）
+三份结果：
+  data/good_links.txt          — 当次测通 + 出口 IP 不重复
+  data/stable_links.txt        — 连续成功跑日 streak（探测不通清零；IP 撞车只挤出 good，
+                                 保留 ok_days + 出口 IP）；门槛爬升到 STABLE_DAYS；
+                                 导出时出口 IP 也互不相同（同 IP 留 streak 更高/更新的）
+  data/stable_links_by_ip.txt  — 与 stable 同集，每行「出口IP 空格 xray_link」，按出口 IP 排序
 
 TARGET_GOOD=0 表示不设上限，把候选测完拿多少算多少。
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import random
@@ -37,6 +39,7 @@ DB = DATA / "state.sqlite"
 GOOD_TXT = DATA / "good_links.txt"       # 当次 good
 FAILED_TXT = DATA / "failed_links.txt"
 STABLE_TXT = DATA / "stable_links.txt"   # 持续可用
+STABLE_BY_IP_TXT = DATA / "stable_links_by_ip.txt"  # 出口IP + link，按 IP 排序
 PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
 
 TARGET = int(os.environ.get("TARGET_GOOD", "0"))           # 0=不设上限，测完为止
@@ -205,6 +208,14 @@ def stable_threshold(conn: sqlite3.Connection) -> int:
     return max(1, min(STABLE_DAYS, days))
 
 
+def _ip_sort_key(ip: str):
+    """IPv4/IPv6 数值排序；解析失败则落到字符串兜底。"""
+    try:
+        return (0, ipaddress.ip_address(ip).packed)
+    except ValueError:
+        return (1, ip.encode())
+
+
 def export_txt(conn: sqlite3.Connection) -> None:
     goods = [r[0] for r in conn.execute(
         "SELECT link FROM links WHERE status='good' ORDER BY updated_at")]
@@ -220,15 +231,25 @@ def export_txt(conn: sqlite3.Connection) -> None:
     ).fetchall()
     seen_ip: set[str] = set()
     stables: list[str] = []
+    stable_pairs: list[tuple[str, str]] = []  # (exit_ip, link)
     for link, ip in rows:
         if ip in seen_ip:
             continue
         seen_ip.add(ip)
         stables.append(link)
+        stable_pairs.append((ip, link))
+    stable_pairs.sort(key=lambda t: _ip_sort_key(t[0]))
     GOOD_TXT.write_text("\n".join(goods) + ("\n" if goods else ""))
     FAILED_TXT.write_text("\n".join(fails) + ("\n" if fails else ""))
     STABLE_TXT.write_text("\n".join(stables) + ("\n" if stables else ""))
-    log(f"export good={len(goods)} failed={len(fails)} stable={len(stables)} (need ok_days>={need}, cap={STABLE_DAYS})")
+    STABLE_BY_IP_TXT.write_text(
+        "\n".join(f"{ip} {link}" for ip, link in stable_pairs)
+        + ("\n" if stable_pairs else "")
+    )
+    log(
+        f"export good={len(goods)} failed={len(fails)} stable={len(stables)} "
+        f"stable_by_ip={len(stable_pairs)} (need ok_days>={need}, cap={STABLE_DAYS})"
+    )
 
 
 def good_count(conn: sqlite3.Connection) -> int:
