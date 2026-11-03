@@ -8,6 +8,10 @@
                                  导出时出口 IP 也互不相同（同 IP 留 streak 更高/更新的）
   data/stable_links_by_ip.txt  — 与 stable 同集，每行「出口IP 空格 xray_link」，按出口 IP 排序
 
+主流程还会：
+  - 复测掉线 good 后，对空出出口 IP 做撞车顶替（failed 且仍带 exit_ip）
+  - 对冷却期满的普通 failed 做有界重试（默认 7 天、每轮最多 2500）
+
 TARGET_GOOD=0 表示不设上限，把候选测完拿多少算多少。
 """
 from __future__ import annotations
@@ -52,6 +56,14 @@ XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
 # 调试：只测前 N 条候选（0=不限制）。快速验证流程用 300～1000。
 DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "0"))  # 0=不截断
+# 撞车顶替：good 掉线后，重试同 exit_ip 的 failed（曾测通但被挤掉）
+COLLISION_RETRY_ENABLE = int(os.environ.get("COLLISION_RETRY_ENABLE", "1"))
+COLLISION_RETRY_PER_IP = int(os.environ.get("COLLISION_RETRY_PER_IP", "2"))
+# 冷却重试：普通 failed（无 exit_ip）过期后再测一小批
+RETRY_FAILED_ENABLE = int(os.environ.get("RETRY_FAILED_ENABLE", "1"))
+RETRY_AFTER_DAYS = float(os.environ.get("RETRY_AFTER_DAYS", "7"))
+RETRY_FAILED_MAX = int(os.environ.get("RETRY_FAILED_MAX", "2500"))
+RETRY_PROBE_TIMEOUT = float(os.environ.get("RETRY_PROBE_TIMEOUT", "5"))  # 仅冷却重试
 
 SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
@@ -359,10 +371,11 @@ def cpu_busy() -> float:
         return 0.5
 
 
-def get_exit_ip(proxy: str) -> str | None:
+def get_exit_ip(proxy: str, timeout: float | None = None) -> str | None:
+    t = TIMEOUT if timeout is None else timeout
     for url in IP_URLS:
         try:
-            ip = http_get(url, timeout=TIMEOUT, proxy=proxy).decode().strip()
+            ip = http_get(url, timeout=t, proxy=proxy).decode().strip()
             if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
                 return ip
         except Exception:
@@ -370,8 +383,9 @@ def get_exit_ip(proxy: str) -> str | None:
     return None
 
 
-def probe(link: str) -> tuple[str, str | None, str]:
+def probe(link: str, timeout: float | None = None) -> tuple[str, str | None, str]:
     """测一条链接：通探针 + 能取到出口 IP 才算 good。按协议选 xray / sing-box。"""
+    t = TIMEOUT if timeout is None else timeout
     parsed = parse_link(link)
     if not parsed:
         return "failed", None, "parse"
@@ -392,10 +406,10 @@ def probe(link: str) -> tuple[str, str | None, str]:
         time.sleep(float(os.environ.get("XRAY_WARMUP", "0.15")))
         proxy = f"socks5h://127.0.0.1:{socks_port}"
         try:
-            http_get(PROBE_URL, timeout=TIMEOUT, proxy=proxy)
+            http_get(PROBE_URL, timeout=t, proxy=proxy)
         except Exception:
             return "failed", None, "917"
-        ip = get_exit_ip(proxy)
+        ip = get_exit_ip(proxy, timeout=t)
         if not ip:
             return "failed", None, "ip"
         return "good", ip, "ok"
@@ -409,6 +423,125 @@ def probe(link: str) -> tuple[str, str | None, str]:
             cfg_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def probe_batch(
+    conn: sqlite3.Connection,
+    links: list[str],
+    *,
+    workers: int | None = None,
+    timeout: float | None = None,
+    tag: str = "PROBE",
+) -> tuple[int, int]:
+    """探测一批链接并 mark；返回 (tested, added_good_count)。"""
+    if not links:
+        return 0, 0
+    workers = workers if workers is not None else min(WORKERS_MAX, max(WORKERS_MIN, 64))
+    tested = added = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(probe, link, timeout): link for link in links}
+        for fut in as_completed(futs):
+            link = futs[fut]
+            tested += 1
+            try:
+                status, ip, reason = fut.result()
+            except Exception:
+                status, ip, reason = "failed", None, "exc"
+            if status == "good":
+                if mark(conn, link, "good", ip):
+                    added += 1
+                    log(f"{tag}_GOOD ip={ip} good_total={good_count(conn)}")
+                else:
+                    log(f"{tag}_DUP_IP ip={ip}")
+            else:
+                mark(conn, link, "failed", None)
+                log(f"{tag}_FAIL reason={reason}")
+    return tested, added
+
+
+def pick_collision_reclaim(conn: sqlite3.Connection, vacated_ips: set[str]) -> list[str]:
+    """对每个空出的出口 IP，取最多 COLLISION_RETRY_PER_IP 条撞车 failed。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for ip in sorted(vacated_ips):
+        rows = conn.execute(
+            "SELECT link FROM links WHERE status='failed' AND exit_ip=? "
+            "ORDER BY ok_days DESC, updated_at DESC LIMIT ?",
+            (ip, COLLISION_RETRY_PER_IP),
+        ).fetchall()
+        for (link,) in rows:
+            if link in seen:
+                continue
+            seen.add(link)
+            out.append(link)
+    log(
+        f"RECLAIM_IP vacated={len(vacated_ips)} candidates={len(out)} "
+        f"per_ip={COLLISION_RETRY_PER_IP}"
+    )
+    return out
+
+
+def pick_cooled_failed(
+    conn: sqlite3.Connection, limit: int, exclude_hashes: set[str]
+) -> list[str]:
+    """冷却期满的普通 failed（无 exit_ip），最多 limit 条可解析链接。"""
+    if limit <= 0:
+        return []
+    cutoff = time.time() - RETRY_AFTER_DAYS * 86400
+    rows = conn.execute(
+        "SELECT link, h FROM links WHERE status='failed' AND exit_ip IS NULL "
+        "AND updated_at <= ? ORDER BY updated_at ASC LIMIT ?",
+        (cutoff, max(limit * 2, limit)),
+    ).fetchall()
+    out: list[str] = []
+    for link, h in rows:
+        if h in exclude_hashes:
+            continue
+        if not parse_link(link):
+            continue
+        out.append(link)
+        if len(out) >= limit:
+            break
+    log(
+        f"RETRY_FAILED scanned={len(rows)} picked={len(out)} "
+        f"after_days={RETRY_AFTER_DAYS} max={limit}"
+    )
+    return out
+
+
+def retest_goods(conn: sqlite3.Connection) -> set[str]:
+    """复测现有 good；返回本轮空出的出口 IP 集合。"""
+    rows = conn.execute(
+        "SELECT link, exit_ip FROM links WHERE status='good'"
+    ).fetchall()
+    if not rows:
+        return set()
+    old_ips = {ip for _, ip in rows if ip}
+    links = [link for link, _ in rows]
+    log(f"retest previous goods={len(links)}")
+    with ThreadPoolExecutor(max_workers=min(64, WORKERS_MAX)) as ex:
+        futs = {ex.submit(probe, link): link for link in links}
+        for fut in as_completed(futs):
+            link = futs[fut]
+            try:
+                status, ip, reason = fut.result()
+            except Exception:
+                status, ip, reason = "failed", None, "exc"
+            if status == "good" and ip:
+                if not mark(conn, link, "good", ip):
+                    log(f"RETEST_DUP ip={ip}")
+            else:
+                mark(conn, link, "failed", None)
+                log(f"RETEST_FAIL reason={reason}")
+    still = {
+        r[0]
+        for r in conn.execute(
+            "SELECT exit_ip FROM links WHERE status='good' AND exit_ip IS NOT NULL"
+        )
+    }
+    vacated = old_ips - still
+    log(f"retest done vacated_ips={len(vacated)} still_good_ips={len(still)}")
+    return vacated
 
 
 def verify_goods(conn: sqlite3.Connection) -> None:
@@ -447,40 +580,55 @@ def main() -> int:
     start_good = good_count(conn)
     log(f"start good={start_good} target={TARGET} stable_days={STABLE_DAYS}")
     log(f"xray_bin={XRAY_BIN} singbox_bin={SINGBOX_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
-    if TARGET > 0 and start_good >= TARGET:
-        log("already enough — still verify + export")
+    log(
+        f"reclaim enable={COLLISION_RETRY_ENABLE} per_ip={COLLISION_RETRY_PER_IP} "
+        f"retry enable={RETRY_FAILED_ENABLE} after_days={RETRY_AFTER_DAYS} "
+        f"max={RETRY_FAILED_MAX} retry_timeout={RETRY_PROBE_TIMEOUT}"
+    )
+
+    reclaim_added = 0
+    retry_added = 0
+    probed_hashes: set[str] = set()
+
+    # 1) 复测现有 good，收集空出的出口 IP
+    vacated_ips: set[str] = set()
+    old_goods = conn.execute(
+        "SELECT 1 FROM links WHERE status='good' LIMIT 1"
+    ).fetchone()
+    if old_goods:
+        vacated_ips = retest_goods(conn)
+        export_txt(conn)
+        for (h,) in conn.execute("SELECT h FROM links WHERE status='good'"):
+            probed_hashes.add(h)
+
+    # 2) 撞车顶替（TARGET 已满也跑：便宜且能补回掉线 IP）
+    if COLLISION_RETRY_ENABLE and vacated_ips:
+        reclaim_links = pick_collision_reclaim(conn, vacated_ips)
+        tested_r, reclaim_added = probe_batch(
+            conn, reclaim_links, workers=min(64, WORKERS_MAX), tag="RECLAIM"
+        )
+        probed_hashes.update(link_hash(x) for x in reclaim_links)
+        log(f"RECLAIM done tested={tested_r} added={reclaim_added}")
+
+    # 3) 已达 TARGET：复测+顶替后直接 verify
+    if TARGET > 0 and good_count(conn) >= TARGET:
+        log("already enough after retest/reclaim — verify + export")
         verify_goods(conn)
+        log(
+            f"done good={good_count(conn)} reclaim_added={reclaim_added} "
+            f"retry_added={retry_added}"
+        )
         return 0
 
-    # 先复测昨天的 good：不通则清 streak（满足「有一次不通就算不通」）
-    old_goods = [r[0] for r in conn.execute(
-        "SELECT link FROM links WHERE status='good'")]
-    if old_goods:
-        log(f"retest previous goods={len(old_goods)}")
-        with ThreadPoolExecutor(max_workers=min(64, WORKERS_MAX)) as ex:
-            futs = {ex.submit(probe, link): link for link in old_goods}
-            for fut in as_completed(futs):
-                link = futs[fut]
-                try:
-                    status, ip, reason = fut.result()
-                except Exception:
-                    status, ip, reason = "failed", None, "exc"
-                if status == "good" and ip:
-                    if not mark(conn, link, "good", ip):
-                        log(f"RETEST_DUP ip={ip}")
-                else:
-                    mark(conn, link, "failed", None)
-                    log(f"RETEST_FAIL reason={reason}")
-        export_txt(conn)
-
+    # 4) 订阅新候选（跳过库内已有 good/failed）
     candidates = fetch_candidates()
     skip = {r[0] for r in conn.execute(
         "SELECT h FROM links WHERE status IN ('good','failed')")}
-    # 跳过无法运行的（ssr/噪声 https 等）：不进 todo，避免永久记 failed
     todo = []
     skipped_unrun = 0
     for c in candidates:
-        if link_hash(c) in skip:
+        h = link_hash(c)
+        if h in skip:
             continue
         if not parse_link(c):
             skipped_unrun += 1
@@ -488,6 +636,7 @@ def main() -> int:
         todo.append(c)
     log(f"candidates={len(candidates)} todo={len(todo)} skip_unrunnable={skipped_unrun}")
 
+    # 5) 只测全新候选
     workers = WORKERS_MAX
     tested = added = 0
     since_flush = 0
@@ -500,6 +649,7 @@ def main() -> int:
             workers = min(WORKERS_MAX, workers + 8)
         batch = todo[i : i + workers * 2]
         i += len(batch)
+        probed_hashes.update(link_hash(x) for x in batch)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(probe, link): link for link in batch}
             for fut in as_completed(futs):
@@ -528,10 +678,34 @@ def main() -> int:
             f"workers={workers} load={busy:.2f}"
         )
 
+    # 6) 冷却重试普通 failed（仍缺额或无 TARGET 时）
+    if RETRY_FAILED_ENABLE and (TARGET <= 0 or good_count(conn) < TARGET):
+        exclude = set(probed_hashes)
+        exclude.update(
+            r[0] for r in conn.execute(
+                "SELECT h FROM links WHERE status='good'"
+            )
+        )
+        retry_links = pick_cooled_failed(conn, RETRY_FAILED_MAX, exclude)
+        tested_t, retry_added = probe_batch(
+            conn,
+            retry_links,
+            workers=min(64, WORKERS_MAX),
+            timeout=RETRY_PROBE_TIMEOUT,
+            tag="RETRY",
+        )
+        log(f"RETRY done tested={tested_t} added={retry_added}")
+
     export_txt(conn)
-    log(f"probe done good={good_count(conn)} tested={tested} added={added}")
+    log(
+        f"probe done good={good_count(conn)} tested={tested} added={added} "
+        f"reclaim_added={reclaim_added} retry_added={retry_added}"
+    )
     verify_goods(conn)
-    log(f"done good={good_count(conn)} tested={tested} added={added}")
+    log(
+        f"done good={good_count(conn)} tested={tested} added={added} "
+        f"reclaim_added={reclaim_added} retry_added={retry_added}"
+    )
     return 0
 
 
