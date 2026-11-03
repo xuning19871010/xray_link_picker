@@ -66,8 +66,6 @@ RETRY_FAILED_MAX = int(os.environ.get("RETRY_FAILED_MAX", "2500"))
 RETRY_PROBE_TIMEOUT = float(os.environ.get("RETRY_PROBE_TIMEOUT", "5"))  # 仅冷却重试
 
 SUBSCRIBE_URLS = [
-    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
-    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/all_extracted_configs.txt",
     "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/all.txt",
     "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt",
     "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt",
@@ -87,8 +85,14 @@ SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/w1770946466/Auto_proxy/main/Long_term_subscription_num",
     "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs_base64.txt",
     "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/super-sub.txt",
-    "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/All_Configs_Sub.txt",
+    "https://raw.githubusercontent.com/mfuu/v2ray/master/sub",
+    "https://raw.githubusercontent.com/hezhanleiok/freesub/main/output/v2ray.txt",
+    "https://vless.svinakraft.workers.dev/fastest.txt",
+    "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/top100.txt",
+    "https://raw.githubusercontent.com/Farid-Karimi/Config-Collector/main/vless_iran.txt",
+    "https://raw.githubusercontent.com/Farid-Karimi/Config-Collector/main/mixed_iran.txt",
+    "https://raw.githubusercontent.com/ZywChannel/free/main/sub",
+    "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/vless.txt",
 ]
 IP_URLS = [
     "https://api.ipify.org",
