@@ -117,5 +117,19 @@ jobs:
             gh release create latest -R "${{ github.repository }}" --target "${{ github.sha }}" \
               --title "latest good/stable links" --notes "$NOTE" --latest
           fi
-          gh release upload latest data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt data/state.sqlite --clobber -R "${{ github.repository }}"
+          # GitHub 拒绝 0 字节 Release 附件（HTTP 400 Bad Content-Length）。
+          # stable 集为空时跳过这两个文件，其余附件照常覆盖上传。
+          assets=()
+          for f in data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt data/state.sqlite; do
+            case "$f" in
+              data/stable_links.txt|data/stable_links_by_ip.txt)
+                if [ ! -s "$f" ]; then
+                  echo "skip empty release asset: $f"
+                  continue
+                fi
+                ;;
+            esac
+            assets+=("$f")
+          done
+          gh release upload latest "${assets[@]}" --clobber -R "${{ github.repository }}"
           gh release edit latest -R "${{ github.repository }}" --notes "$NOTE"
