@@ -15,10 +15,6 @@ USER_LINE = (
     "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC28Ehzv/Bzi8MWpk1QkRgaR/rYyhFxHaFywmF0/wNg1isq5dpUgerw35eOeY3DwekOMkSMgRcmRcUkExFnJjz1cjtqBBoV1hctfo9xyAnZAkrEirtSgFoUMGnKZW1I3FQXg8t1HL6c6ZEgZWg5SeuOQEIb3gzImHA7xxCumUXXI8QB225q72pGET1JRjdRO9/2izkATmB3ibTNRqK4xZ/N37qHsJVQLWytmZbznIQTKENLfVDVxubd1wYJzDqet8Pnv3L/dxlLalCxXERuv4wCAuC+f+qVBlAB2BqK30Jhgt9BNl6Ywulbz9zu77bwiELkWUmOrdELGdTWkLwTaUZGNsjxQOceXUnMvhAkQ/QheOk4xFAURpQwyz1Xu2yWn+lGtaSMdpQZjdlqo54gNf6VUqcv0IZ4G1DSdQ4r+bpQ22sFKCVVg1jBJvAC8MSWhD1VLqPVV8jybvkIm40dGZokRCrYpdI8RNMZ7i21De6KTi55djllOmaYqjIl/VhfiFc= "
     "shou_gang@163.com"
 )
-VERIFIER_LINE = (
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEQAlCxBuFQLdCiOXrX7ghPQfYnud0tknqql7xx/anz "
-    "xray-temporary-verification"
-)
 
 
 def _free_port() -> int:
@@ -32,12 +28,13 @@ def _free_port() -> int:
 class TestRootPubkeySSH(unittest.TestCase):
     def test_authorized_keys_are_exact(self) -> None:
         lines = KEYS.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines, [USER_LINE, VERIFIER_LINE])
+        self.assertEqual(lines, [USER_LINE])
         fingerprints = subprocess.check_output(
             ["ssh-keygen", "-lf", str(KEYS)], text=True
         )
-        self.assertIn("SHA256:", fingerprints)
-        self.assertEqual(fingerprints.count("\n"), 2)
+        self.assertIn("SHA256:71eEnsm2YJbrqHrf99oIxKfJ0obj3kGcj20GYCjHuRQ", fingerprints)
+        self.assertNotIn("xray-temporary-verification", fingerprints)
+        self.assertEqual(fingerprints.count("\n"), 1)
 
     def test_dropin_wins_over_ubuntu_cloud_init(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -104,11 +101,8 @@ class TestRootPubkeySSH(unittest.TestCase):
             )
             auth = base / "authorized_keys"
             auth.write_text(
-                (base / "client.pub").read_text(encoding="utf-8")
-                + USER_LINE
-                + "\n"
-                + VERIFIER_LINE
-                + "\n",
+                KEYS.read_text(encoding="utf-8")
+                + (base / "client.pub").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
             os.chmod(auth, 0o600)
