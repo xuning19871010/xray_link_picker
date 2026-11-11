@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from export import export_all, stable_threshold
+from export import export_all
 from link_parse import parse_link
 from storage import (
     ProbeRecord,
@@ -42,6 +42,7 @@ from storage import (
     parse_and_validate_exit_ip,
     purge_old_observations,
     record_probe_batch,
+    remember_links,
 )
 
 # ---------- 路径与参数（可用环境变量覆盖）----------
@@ -54,22 +55,19 @@ STABLE_TXT = DATA / "stable_links.txt"   # 持续可用
 STABLE_BY_IP_TXT = DATA / "stable_links_by_ip.txt"  # 出口IP + link，按 IP 排序
 PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
 
-TARGET = int(os.environ.get("TARGET_GOOD", "0"))           # 0=不设上限，测完为止
+TARGET = int(os.environ.get("TARGET_GOOD", "0"))           # 0=不设唯一出口 IP 上限
+RUN_BUDGET_SEC = float(os.environ.get("RUN_BUDGET_SEC", "18000"))  # 到点停测并发布，未测保持 pending
 STABLE_DAYS = int(os.environ.get("STABLE_DAYS", "30"))     # streak 满多少天算「满额」stable
 WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "384"))
 WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "256"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
 PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
 IP_CHECK_URL = os.environ.get("IP_CHECK_URL", "https://checkip.amazonaws.com").strip()
-IP_FALLBACK_URLS = [u.strip() for u in os.environ.get("IP_FALLBACK_URLS", "").split(",") if u.strip()]
 IP_FAMILY = os.environ.get("IP_FAMILY", "4").strip()
 XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
 # 调试：只测前 N 条候选（0=不限制）。快速验证流程用 300～1000。
 DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "0"))  # 0=不截断
-# 撞车顶替：good 掉线后，重试同 exit_ip 的 failed（曾测通但被挤掉）
-COLLISION_RETRY_ENABLE = int(os.environ.get("COLLISION_RETRY_ENABLE", "1"))
-COLLISION_RETRY_PER_IP = int(os.environ.get("COLLISION_RETRY_PER_IP", "2"))
 # 冷却重试：普通 failed（无 exit_ip）过期后再测一小批
 RETRY_FAILED_ENABLE = int(os.environ.get("RETRY_FAILED_ENABLE", "1"))
 RETRY_AFTER_DAYS = float(os.environ.get("RETRY_AFTER_DAYS", "7"))
@@ -253,26 +251,19 @@ def cpu_busy() -> float:
 def discover_exit_ip(
     proxy: str, timeout: float | None = None
 ) -> tuple[str | None, str, str | None, str]:
-    """查询出口 IP 并严格校验单个公网 IP 与协议栈，返回 (exit_ip, ip_source, ip_version, reason)。"""
+    """只请求配置的单一测量端点，不跨源回退。返回 (exit_ip, ip_source, ip_version, reason)。"""
     t = TIMEOUT if timeout is None else timeout
-    urls = [u for u in [IP_CHECK_URL, *IP_FALLBACK_URLS] if u]
-    if not urls:
+    src = normalize_ip_source(IP_CHECK_URL)
+    if not IP_CHECK_URL:
         return None, "unknown", None, "ip_config"
-    last_src = normalize_ip_source(urls[0])
-    last_reason = "ip_http"
-    for url in urls:
-        src = normalize_ip_source(url)
-        last_src = src
-        try:
-            raw = http_get(url, timeout=t, proxy=proxy, ip_family=IP_FAMILY).decode("utf-8", "ignore")
-        except Exception:
-            last_reason = "ip_http"
-            continue
-        ip, ver, v_reason = parse_and_validate_exit_ip(raw, allowed_family=IP_FAMILY, require_global=True)
-        if ip and ver:
-            return ip, src, ver, "ok"
-        last_reason = v_reason
-    return None, last_src, None, last_reason
+    try:
+        raw = http_get(IP_CHECK_URL, timeout=t, proxy=proxy, ip_family=IP_FAMILY).decode("utf-8", "ignore")
+    except Exception:
+        return None, src, None, "ip_http"
+    ip, ver, v_reason = parse_and_validate_exit_ip(raw, allowed_family=IP_FAMILY, require_global=True)
+    if ip and ver:
+        return ip, src, ver, "ok"
+    return None, src, None, v_reason
 
 
 def get_exit_ip(proxy: str, timeout: float | None = None) -> str | None:
@@ -413,28 +404,6 @@ def probe_batch(
     return tested, added
 
 
-def pick_collision_reclaim(conn: sqlite3.Connection, vacated_ips: set[str]) -> list[str]:
-    """对每个空出的出口 IP，取最多 COLLISION_RETRY_PER_IP 条旧库撞车 failed。"""
-    out: list[str] = []
-    seen: set[str] = set()
-    for ip in sorted(vacated_ips):
-        rows = conn.execute(
-            "SELECT link FROM links WHERE status='failed' AND exit_ip=? "
-            "ORDER BY ok_days DESC, updated_at DESC LIMIT ?",
-            (ip, COLLISION_RETRY_PER_IP),
-        ).fetchall()
-        for (link,) in rows:
-            if link in seen:
-                continue
-            seen.add(link)
-            out.append(link)
-    log(
-        f"RECLAIM_IP vacated={len(vacated_ips)} candidates={len(out)} "
-        f"per_ip={COLLISION_RETRY_PER_IP}"
-    )
-    return out
-
-
 def pick_cooled_failed(
     conn: sqlite3.Connection, limit: int, exclude_hashes: set[str]
 ) -> list[str]:
@@ -487,31 +456,61 @@ def retest_goods(
     return vacated
 
 
-def verify_goods(
-    conn: sqlite3.Connection, run_key: str, seq_tracker: dict[str, int]
-) -> None:
-    """收尾复验：再测一遍 good，剔除掉线的链接（导出时自动按出口 IP 去重）。"""
-    rows = conn.execute(
-        "SELECT link FROM links WHERE status='good' ORDER BY updated_at"
-    ).fetchall()
-    links = [r[0] for r in rows]
-    log(f"verify start count={len(links)}")
-    records = _run_probes_parallel(
-        links, workers=min(64, max(8, WORKERS_MAX // 2)), timeout=None, stage="verify", seq_tracker=seq_tracker
-    )
-    record_probe_batch(conn, run_key, records, default_ip_source=normalize_ip_source(IP_CHECK_URL))
-    keep = sum(1 for r in records if r.status == "good")
-    drop = len(records) - keep
-    export_txt(conn)
-    log(f"verify done keep={keep} drop={drop} unique_ip={good_count(conn)}")
-
-
 # ---------- 主流程 ----------
+def _budget_ok(started: float) -> bool:
+    budget = float(os.environ.get("RUN_BUDGET_SEC", "18000"))
+    return time.time() - started < budget
+
+
+def _probe_list(
+    conn: sqlite3.Connection,
+    run_key: str,
+    links: list[str],
+    seq_tracker: dict[str, int],
+    started: float,
+    stage: str,
+    timeout: float | None = None,
+    stop_at_target: bool = False,
+) -> tuple[int, int]:
+    tested = added = 0
+    i = 0
+    workers = WORKERS_MAX
+    since_flush = 0
+    while i < len(links) and _budget_ok(started):
+        if stop_at_target and TARGET > 0 and good_count(conn) >= TARGET:
+            break
+        busy = cpu_busy()
+        if busy > 3.0:
+            workers = max(WORKERS_MIN, workers - 8)
+        elif busy < 1.0:
+            workers = min(WORKERS_MAX, workers + 8)
+        batch = links[i : i + workers * 2]
+        i += len(batch)
+        records = _run_probes_parallel(
+            batch, workers=workers, timeout=timeout, stage=stage, seq_tracker=seq_tracker
+        )
+        b_tested, b_good = record_probe_batch(
+            conn, run_key, records, default_ip_source=normalize_ip_source(IP_CHECK_URL)
+        )
+        tested += b_tested
+        added += b_good
+        since_flush += b_good
+        if since_flush >= 50:
+            export_txt(conn)
+            since_flush = 0
+        log(
+            f"{stage} tested={tested} added={added} good_ips={good_count(conn)} "
+            f"workers={workers} load={busy:.2f}"
+        )
+    return tested, added
+
+
 def main() -> int:
     DATA.mkdir(parents=True, exist_ok=True)
     conn = db_connect()
     run_key = begin_run(conn, ip_source=normalize_ip_source(IP_CHECK_URL))
     seq_tracker: dict[str, int] = {}
+    started = time.time()
 
     def _on_signal(signum: int, _frame) -> None:
         try:
@@ -524,131 +523,57 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    start_good = good_count(conn)
-    log(f"start good={start_good} target={TARGET} stable_days={STABLE_DAYS} ip_check_url={IP_CHECK_URL}")
-    log(f"xray_bin={XRAY_BIN} singbox_bin={SINGBOX_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
+    pending_now = conn.execute("SELECT COUNT(*) FROM links WHERE status='pending'").fetchone()[0]
     log(
-        f"reclaim enable={COLLISION_RETRY_ENABLE} per_ip={COLLISION_RETRY_PER_IP} "
-        f"retry enable={RETRY_FAILED_ENABLE} after_days={RETRY_AFTER_DAYS} "
-        f"max={RETRY_FAILED_MAX} retry_timeout={RETRY_PROBE_TIMEOUT}"
+        f"start epoch run_key={run_key} good_ips={good_count(conn)} "
+        f"pending={pending_now} "
+        f"budget_sec={os.environ.get('RUN_BUDGET_SEC', '18000')} ip_check_url={IP_CHECK_URL}"
     )
+    log(f"xray_bin={XRAY_BIN} singbox_bin={SINGBOX_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
 
-    reclaim_added = 0
-    retry_added = 0
-    probed_hashes: set[str] = set()
-
-    # 1) 复测现有 good，收集空出的出口 IP
-    vacated_ips: set[str] = set()
-    old_goods = conn.execute(
-        "SELECT 1 FROM links WHERE status='good' LIMIT 1"
-    ).fetchone()
-    if old_goods:
-        vacated_ips = retest_goods(conn, run_key, seq_tracker)
-        export_txt(conn)
-        for (h,) in conn.execute("SELECT h FROM links WHERE status='good'"):
-            probed_hashes.add(h)
-
-    # 2) 撞车顶替（TARGET 已满也跑：便宜且能补回掉线 IP）
-    if COLLISION_RETRY_ENABLE and vacated_ips:
-        reclaim_links = pick_collision_reclaim(conn, vacated_ips)
-        tested_r, reclaim_added = probe_batch(
-            conn, run_key, reclaim_links, workers=min(64, WORKERS_MAX), tag="RECLAIM", seq_tracker=seq_tracker
-        )
-        probed_hashes.update(link_hash(x) for x in reclaim_links)
-        log(f"RECLAIM done tested={tested_r} added={reclaim_added}")
-
-    # 3) 已达 TARGET：复测+顶替后直接 verify
-    if TARGET > 0 and good_count(conn) >= TARGET:
-        log("already enough after retest/reclaim — verify + export")
-        verify_goods(conn, run_key, seq_tracker)
-        end_run(conn, run_key, status="completed")
-        purge_old_observations(conn)
-        log(
-            f"done good={good_count(conn)} reclaim_added={reclaim_added} "
-            f"retry_added={retry_added}"
-        )
-        conn.close()
-        return 0
-
-    # 4) 订阅新候选（跳过库内已有 good/failed）
+    # 先入库新链接，未测保持 pending，即使后面预算用完也不会记成失败。
     candidates = fetch_candidates()
-    skip = {r[0] for r in conn.execute(
-        "SELECT h FROM links WHERE status IN ('good','failed')")}
-    todo = []
+    runnable = []
     skipped_unrun = 0
     for c in candidates:
-        h = link_hash(c)
-        if h in skip:
-            continue
-        if not parse_link(c):
+        if parse_link(c):
+            runnable.append(c)
+        else:
             skipped_unrun += 1
-            continue
-        todo.append(c)
-    log(f"candidates={len(candidates)} todo={len(todo)} skip_unrunnable={skipped_unrun}")
+    added_pending = remember_links(conn, runnable)
+    log(f"candidates={len(candidates)} runnable={len(runnable)} new_pending={added_pending} skip_unparseable={skipped_unrun}")
 
-    # 5) 只测全新候选
-    workers = WORKERS_MAX
-    tested = added = 0
-    since_flush = 0
-    i = 0
-    while i < len(todo) and (TARGET <= 0 or good_count(conn) < TARGET):
-        busy = cpu_busy()
-        if busy > 3.0:
-            workers = max(WORKERS_MIN, workers - 8)
-        elif busy < 1.0:
-            workers = min(WORKERS_MAX, workers + 8)
-        batch = todo[i : i + workers * 2]
-        i += len(batch)
-        probed_hashes.update(link_hash(x) for x in batch)
-        records = _run_probes_parallel(
-            batch, workers=workers, timeout=None, stage="candidate", seq_tracker=seq_tracker
-        )
-        b_tested, b_good = record_probe_batch(
-            conn, run_key, records, default_ip_source=normalize_ip_source(IP_CHECK_URL)
-        )
-        tested += b_tested
-        added += b_good
-        since_flush += b_good
-        if since_flush >= 50:
-            export_txt(conn)
-            since_flush = 0
-        log(
-            f"progress tested={tested} added={added} good={good_count(conn)} "
-            f"workers={workers} load={busy:.2f}"
-        )
+    if _budget_ok(started) and conn.execute("SELECT 1 FROM links WHERE status='good' LIMIT 1").fetchone():
+        retest_goods(conn, run_key, seq_tracker)
+        export_txt(conn)
 
-    # 6) 冷却重试普通 failed（仍缺额或无 TARGET 时）
-    if RETRY_FAILED_ENABLE and (TARGET <= 0 or good_count(conn) < TARGET):
-        exclude = set(probed_hashes)
-        exclude.update(
-            r[0] for r in conn.execute(
-                "SELECT h FROM links WHERE status='good'"
-            )
-        )
-        retry_links = pick_cooled_failed(conn, RETRY_FAILED_MAX, exclude)
-        tested_t, retry_added = probe_batch(
-            conn,
-            run_key,
-            retry_links,
-            workers=min(64, WORKERS_MAX),
+    retry_added = 0
+    if RETRY_FAILED_ENABLE and _budget_ok(started) and (TARGET <= 0 or good_count(conn) < TARGET):
+        probed = {r[0] for r in conn.execute("SELECT h FROM links WHERE status='good'")}
+        retry_links = pick_cooled_failed(conn, RETRY_FAILED_MAX, probed)
+        _tested, retry_added = _probe_list(
+            conn, run_key, retry_links, seq_tracker, started, "retry",
             timeout=RETRY_PROBE_TIMEOUT,
-            tag="RETRY",
-            seq_tracker=seq_tracker,
         )
-        log(f"RETRY done tested={tested_t} added={retry_added}")
 
-    export_txt(conn)
-    log(
-        f"probe done good={good_count(conn)} tested={tested} added={added} "
-        f"reclaim_added={reclaim_added} retry_added={retry_added}"
+    pending = [
+        r[0] for r in conn.execute(
+            "SELECT link FROM links WHERE status='pending' ORDER BY updated_at ASC, h ASC"
+        )
+    ]
+    tested, added = _probe_list(
+        conn, run_key, pending, seq_tracker, started, "pending", stop_at_target=True
     )
-    verify_goods(conn, run_key, seq_tracker)
+    pending_left = conn.execute("SELECT COUNT(*) FROM links WHERE status='pending'").fetchone()[0]
+    if pending_left:
+        log(f"budget stop pending_left={pending_left}（未测不是失败，也不是 0 条可用）")
+
     end_run(conn, run_key, status="completed")
     purge_old_observations(conn)
     export_txt(conn)
     log(
-        f"done good={good_count(conn)} tested={tested} added={added} "
-        f"reclaim_added={reclaim_added} retry_added={retry_added}"
+        f"done good_ips={good_count(conn)} pending_left={pending_left} "
+        f"pending_tested={tested} pending_new_good={added} retry_added={retry_added}"
     )
     conn.close()
     return 0

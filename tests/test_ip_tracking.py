@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -37,78 +38,64 @@ class TestIpTrackingAndQueries(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_01_v1_migration_preserves_state_and_repeat_idempotency(self) -> None:
-        """v1 迁移保留身份/状态/updated_at/streak 与 legacy_links_snapshot，不伪造历史或 added_at。"""
-        raw_conn = sqlite3.connect(str(self.db_path))
-        raw_conn.execute(
+    def test_01_legacy_db_is_rejected_without_modification(self) -> None:
+        """旧库只归档：打开时拒绝，且不改文件、不导入链接或计数。"""
+        raw = sqlite3.connect(str(self.db_path))
+        raw.execute(
             """
             CREATE TABLE links(
-                h TEXT PRIMARY KEY,
-                link TEXT NOT NULL,
-                status TEXT NOT NULL,
-                exit_ip TEXT,
-                ok_days INTEGER NOT NULL DEFAULT 0,
-                last_ok_day TEXT,
-                updated_at REAL NOT NULL
+                h TEXT PRIMARY KEY, link TEXT NOT NULL, status TEXT NOT NULL,
+                exit_ip TEXT, ok_days INTEGER NOT NULL DEFAULT 0,
+                last_ok_day TEXT, updated_at REAL NOT NULL
             )
             """
         )
-        raw_conn.execute(
-            "CREATE UNIQUE INDEX idx_ip ON links(exit_ip) WHERE exit_ip IS NOT NULL AND status='good'"
-        )
-        t0 = ts_shanghai(2026, 11, 1, 10, 0)
-        l1 = "vless://u1@example.com:443?security=tls#n1"
-        l2 = "vless://u2@example.com:443?security=tls#n2"
-        raw_conn.execute(
+        raw.execute(
             "INSERT INTO links VALUES(?,?,?,?,?,?,?)",
-            (storage.link_hash(l1), l1, "good", "54.230.1.10", 5, "2026-11-01", t0),
+            ("h1", "vless://old@example.com:443", "good", "1.2.3.4", 9, "2026-10-01", 1.0),
         )
-        raw_conn.execute(
-            "INSERT INTO links VALUES(?,?,?,?,?,?,?)",
-            (storage.link_hash(l2), l2, "failed", None, 0, None, t0 - 86400 * 10),
-        )
-        raw_conn.commit()
-        raw_conn.close()
+        raw.commit()
+        raw.close()
+        before = self.db_path.read_bytes()
+        with self.assertRaises(RuntimeError):
+            storage.open_db(self.db_path)
+        self.assertEqual(self.db_path.read_bytes(), before)
+        self.assertFalse(storage.db_is_current_epoch(self.db_path))
 
-        conn = storage.open_db(self.db_path, readonly=False)
-        self.assertEqual(storage.get_schema_version(conn), 2)
-        self.assertTrue(self.db_path.with_suffix(".sqlite.v1.bak").exists())
-
-        rows = conn.execute(
-            "SELECT link, status, exit_ip, ip_source, ip_version, ok_days, last_ok_day, updated_at FROM links ORDER BY link"
-        ).fetchall()
-        self.assertEqual(
-            rows,
-            [
-                (l1, "good", "54.230.1.10", "legacy_mixed", "ipv4", 5, "2026-11-01", t0),
-                (l2, "failed", None, None, None, 0, None, t0 - 86400 * 10),
-            ],
-        )
-        snap_cnt = conn.execute("SELECT COUNT(*) FROM legacy_links_snapshot").fetchone()[0]
-        self.assertEqual(snap_cnt, 2)
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_ip_links").fetchone()[0], 0)
-
-        # 次日复测成功时，旧版 ok_days 在 UTC 口径下继续从 5 递增为 6（不静默清零旧计数器）
-        t_next = ts_shanghai(2026, 11, 2, 10, 0)
-        rk = storage.begin_run(conn, run_id="101", started_at=t_next)
-        storage.record_probe_batch(
-            conn,
-            rk,
-            [storage.ProbeRecord(l1, "good", "54.230.1.99", "ok", t_next + 1, "retest", 1)],
-        )
-        storage.end_run(conn, rk, "completed", ended_at=t_next + 5)
-        new_row = conn.execute(
-            "SELECT exit_ip, ip_source, ok_days, last_ok_day FROM links WHERE h=?",
-            (storage.link_hash(l1),),
-        ).fetchone()
-        self.assertEqual(
-            new_row, ("54.230.1.99", "https://checkip.amazonaws.com", 6, "2026-11-02")
-        )
+        fresh = self.dir / "fresh.sqlite"
+        conn = storage.open_db(fresh)
+        self.assertEqual(storage.read_epoch(fresh), storage.EPOCH)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM links").fetchone()[0], 0)
         conn.close()
 
-        conn2 = storage.open_db(self.db_path, readonly=False)
-        self.assertEqual(storage.get_schema_version(conn2), 2)
-        conn2.close()
+        wrong = self.dir / "wrong.sqlite"
+        wconn = storage.open_db(wrong)
+        wconn.execute("UPDATE meta SET v='other-epoch' WHERE k='epoch'")
+        wconn.commit()
+        wconn.close()
+        wrong_before = wrong.read_bytes()
+        with self.assertRaises(RuntimeError):
+            storage.open_db(wrong)
+        self.assertEqual(wrong.read_bytes(), wrong_before)
+
+    def test_01b_release_acceptance_and_pending(self) -> None:
+        """预发布/草稿/旧纪元/校验失败不能恢复；未探测保持 pending。"""
+        ok = dict(epoch_text=storage.EPOCH + "\n", checksum_ok=True, is_prerelease=False, is_draft=False)
+        self.assertTrue(storage.release_restorable(**ok))
+        self.assertFalse(storage.release_restorable(**{**ok, "is_prerelease": True}))
+        self.assertFalse(storage.release_restorable(**{**ok, "is_draft": True}))
+        self.assertFalse(storage.release_restorable(**{**ok, "checksum_ok": False}))
+        self.assertFalse(storage.release_restorable(**{**ok, "epoch_text": "legacy"}))
+        tag = storage.release_tag("42954417199", 2, ts=1_700_000_000)
+        self.assertTrue(tag.startswith("run-") and tag.endswith("-42954417199-2"))
+
+        conn = storage.open_db(self.db_path)
+        link = "vless://pending@example.com:443#p"
+        self.assertEqual(storage.remember_links(conn, [link, link]), 1)
+        self.assertEqual(storage.remember_links(conn, [link]), 0)
+        status = conn.execute("SELECT status FROM links").fetchone()[0]
+        self.assertEqual(status, "pending")
+        conn.close()
 
     def test_02_ip_collision_keeps_both_good_and_dedups_only_on_export(self) -> None:
         """同出口 IP 的多条成功链接均保持真实 good，每日统计计为 2，仅导出代表文件时选 1 条。"""
@@ -437,6 +424,51 @@ class TestIpTrackingAndQueries(unittest.TestCase):
 
         after_sha = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
         self.assertEqual(before_sha, after_sha)
+
+    def test_11_budget_leaves_pending_and_workflow_has_no_artifact_restore(self) -> None:
+        """预算用尽时未测链接保持 pending；workflow 不再从 Artifact 恢复。"""
+        link = "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#budget"
+        orig = (
+            select_links.DATA,
+            select_links.DB,
+            select_links.PROGRESS_FILE,
+            select_links.fetch_candidates,
+            select_links.probe,
+        )
+        os.environ["RUN_BUDGET_SEC"] = "0"
+        try:
+            select_links.DATA = self.out_dir
+            select_links.DB = self.db_path
+            select_links.PROGRESS_FILE = self.out_dir / "progress.txt"
+            select_links.fetch_candidates = lambda: [link]
+            select_links.probe = lambda link, timeout=None: (_ for _ in ()).throw(AssertionError("不应探测"))
+            self.assertEqual(select_links.main(), 0)
+        finally:
+            (
+                select_links.DATA,
+                select_links.DB,
+                select_links.PROGRESS_FILE,
+                select_links.fetch_candidates,
+                select_links.probe,
+            ) = orig
+            os.environ.pop("RUN_BUDGET_SEC", None)
+
+        conn = storage.open_db(self.db_path)
+        self.assertEqual(
+            conn.execute("SELECT status FROM links").fetchone()[0],
+            "pending",
+        )
+        conn.close()
+        text = (ROOT / ".github/workflows/select_xray_links.yml").read_text(encoding="utf-8")
+        self.assertNotIn("actions/upload-artifact", text)
+        self.assertNotIn("actions/artifacts", text)
+        self.assertIn("bootstrap", text)
+        self.assertIn(
+            'cron: "0 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23 * * *"',
+            text,
+        )
+        self.assertIn("--prerelease", text)
+        self.assertNotIn("gh release upload latest", text)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-SCHEMA_VERSION = 2
+EPOCH = "checkip-amazonaws-ipv4-1"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 RAW_RETENTION_DAYS = int(os.environ.get("RAW_RETENTION_DAYS", "30"))
 DEFAULT_IP_SOURCE = "https://checkip.amazonaws.com"
@@ -117,10 +117,6 @@ def _ensure_v2_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_links_status_ip ON links(status, exit_ip);
         CREATE INDEX IF NOT EXISTS idx_links_failed_updated ON links(status, updated_at) WHERE exit_ip IS NULL;
 
-        CREATE TABLE IF NOT EXISTS legacy_links_snapshot(
-            h TEXT PRIMARY KEY, status TEXT NOT NULL, exit_ip TEXT,
-            ok_days INTEGER NOT NULL, last_ok_day TEXT, updated_at REAL NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS runs(
             run_key TEXT PRIMARY KEY, run_id TEXT NOT NULL, run_attempt INTEGER NOT NULL DEFAULT 1,
             started_at REAL NOT NULL, ended_at REAL, start_day TEXT NOT NULL, end_day TEXT,
@@ -168,92 +164,94 @@ def _ensure_v2_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def backup_sqlite(src_conn: sqlite3.Connection, backup_path: Path) -> None:
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    if backup_path.exists():
-        backup_path.unlink()
-    dst_conn = sqlite3.connect(str(backup_path))
+def _ro_connect(db_path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, check_same_thread=False)
+
+
+def read_epoch(db_path: Path) -> str | None:
+    """只读查看纪元。文件不存在、不是本结构或没有 epoch 时返回 None，不创建、不修改文件。"""
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return None
     try:
-        with dst_conn:
-            src_conn.backup(dst_conn)
+        conn = _ro_connect(db_path)
+    except sqlite3.Error:
+        return None
+    try:
+        chk = conn.execute("PRAGMA quick_check").fetchone()
+        if not chk or chk[0] != "ok":
+            return None
+        has_meta = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if not has_meta:
+            return None
+        row = conn.execute("SELECT v FROM meta WHERE k='epoch'").fetchone()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
     finally:
-        dst_conn.close()
+        conn.close()
 
 
-def get_schema_version(conn: sqlite3.Connection) -> int:
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
-        has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='links'").fetchone()
-        return 1 if has_links else 0
-    row = conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
-    return int(row[0]) if row else 1
+def db_is_current_epoch(db_path: Path) -> bool:
+    return read_epoch(db_path) == EPOCH
 
 
-def _migrate_links_columns(conn: sqlite3.Connection) -> None:
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='links'").fetchone():
-        return
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(links)")}
-    if "ok_days" not in cols:
-        conn.execute("ALTER TABLE links ADD COLUMN ok_days INTEGER NOT NULL DEFAULT 0")
-    if "last_ok_day" not in cols:
-        conn.execute("ALTER TABLE links ADD COLUMN last_ok_day TEXT")
-    if "ip_source" not in cols:
-        conn.execute("ALTER TABLE links ADD COLUMN ip_source TEXT")
-        conn.execute("UPDATE links SET ip_source='legacy_mixed' WHERE exit_ip IS NOT NULL AND ip_source IS NULL")
-    if "ip_version" not in cols:
-        conn.execute("ALTER TABLE links ADD COLUMN ip_version TEXT")
-        conn.execute(
-            "UPDATE links SET ip_version = CASE WHEN instr(exit_ip, ':') > 0 THEN 'ipv6' ELSE 'ipv4' END "
-            "WHERE exit_ip IS NOT NULL AND ip_version IS NULL"
-        )
+def release_restorable(*, epoch_text: str, checksum_ok: bool, is_prerelease: bool, is_draft: bool) -> bool:
+    """只有校验通过、非草稿、非预发布、且纪元匹配的 Release 才能用于恢复。"""
+    return (not is_prerelease) and (not is_draft) and bool(checksum_ok) and epoch_text.strip() == EPOCH
+
+
+def release_tag(run_id: str, run_attempt: int | str, ts: float | None = None) -> str:
+    t = time.time() if ts is None else ts
+    stamp = datetime.fromtimestamp(t, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rid = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in str(run_id)) or "local"
+    return f"run-{stamp}-{rid}-{int(run_attempt)}"
 
 
 def open_db(db_path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+    """打开本纪元数据库。已有文件但纪元不符时直接拒绝，不迁移、不改写。"""
     if readonly:
-        if not db_path.exists():
-            raise FileNotFoundError(f"数据库文件不存在: {db_path}")
-        return sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, check_same_thread=False)
+        if not db_is_current_epoch(db_path):
+            raise RuntimeError(f"拒绝只读打开非本纪元数据库: {db_path}")
+        return _ro_connect(db_path)
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    existed_before = db_path.exists() and db_path.stat().st_size > 0
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        with conn:
+            _ensure_v2_tables(conn)
+            conn.execute("INSERT INTO meta(k, v) VALUES('epoch', ?)", (EPOCH,))
+            conn.execute("INSERT INTO meta(k, v) VALUES('created_at', ?)", (str(time.time()),))
+        return conn
+
+    if not db_is_current_epoch(db_path):
+        raise RuntimeError(
+            f"拒绝打开纪元不是 {EPOCH} 的数据库 {db_path}。旧 Release/Artifact 只作归档，不能恢复进来。"
+        )
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-
-    ver = get_schema_version(conn)
-    if ver >= SCHEMA_VERSION:
-        _migrate_links_columns(conn)
-        _ensure_v2_tables(conn)
-        conn.commit()
-        return conn
-
-    backup_path = db_path.with_suffix(".sqlite.v1.bak")
-    if existed_before and ver == 1:
-        backup_sqlite(conn, backup_path)
-
-    try:
-        with conn:
-            _migrate_links_columns(conn)
-            conn.execute("DROP INDEX IF EXISTS idx_ip")
-            _ensure_v2_tables(conn)
-            if ver == 1:
-                conn.execute(
-                    "INSERT OR IGNORE INTO legacy_links_snapshot(h, status, exit_ip, ok_days, last_ok_day, updated_at) "
-                    "SELECT h, status, exit_ip, ok_days, last_ok_day, updated_at FROM links"
-                )
-            conn.execute("INSERT OR IGNORE INTO meta(k, v) VALUES('migrated_at', ?)", (str(time.time()),))
-            conn.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
-    except Exception:
-        conn.close()
-        if existed_before and backup_path.exists():
-            src, dst = sqlite3.connect(str(backup_path)), sqlite3.connect(str(db_path))
-            try:
-                with dst:
-                    src.backup(dst)
-            finally:
-                src.close()
-                dst.close()
-        raise
     return conn
+
+
+def remember_links(conn: sqlite3.Connection, links: list[str], seen_at: float | None = None) -> int:
+    """把新链接记为 pending。已存在的不改状态；未探测不是失败。"""
+    now = time.time() if seen_at is None else seen_at
+    added = 0
+    with conn:
+        for link in links:
+            norm = normalize_link(link)
+            if not norm:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO links(h, link, status, ok_days, updated_at) VALUES(?, ?, 'pending', 0, ?)",
+                (link_hash(norm), norm, now),
+            )
+            added += cur.rowcount
+    return added
 
 
 def make_run_key(run_id: str | None = None, run_attempt: int | str | None = None) -> tuple[str, str, int]:
@@ -326,7 +324,8 @@ def end_run(conn: sqlite3.Connection, run_key: str, status: str = "completed", e
             )
 
 
-def _bump_ok_days_legacy_utc(prev_ok_days: int, prev_last_ok_day: str | None, ts: float) -> tuple[int, str]:
+def _bump_ok_days(prev_ok_days: int, prev_last_ok_day: str | None, ts: float) -> tuple[int, str]:
+    """单链接连续成功天数，按 UTC 日期。只由实际探测更新。"""
     d = utc_day(ts)
     today_s = d.isoformat()
     yesterday_s = (d - timedelta(days=1)).isoformat()
@@ -398,7 +397,7 @@ def record_probe_batch(
 
             prev = conn.execute("SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)).fetchone()
             if is_good:
-                ok_days, last_ok = _bump_ok_days_legacy_utc(prev[0] if prev else 0, prev[1] if prev else None, rec.ts)
+                ok_days, last_ok = _bump_ok_days(prev[0] if prev else 0, prev[1] if prev else None, rec.ts)
             else:
                 ok_days, last_ok = 0, None
 

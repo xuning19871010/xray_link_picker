@@ -1,8 +1,24 @@
 # xray_link_picker
 
-自动拉取公开订阅源并探测可用的 `xray` / `sing-box` 分享链接，同时按**出口 IP（测量端点作用域）× 自然日（Asia/Shanghai）**记录与统计每日对应的 DISTINCT `xray_link`。
+自动拉取公开订阅源并探测可用的 `xray` / `sing-box` 分享链接，按出口 IP 和上海日历日统计每天有多少条不同链接。
 
-## 输出文件说明（`data/` 目录及 Release `latest` 附件）
+当前采集纪元是 `checkip-amazonaws-ipv4-1`。这个纪元从空库开始，不导入旧链接、旧出口 IP、旧计数或旧按日记录。旧 Release 和 Artifact 留着当档案，恢复时会跳过。
+
+## 第一次运行
+
+在新代码已经在默认分支上、并且没有正在跑的旧任务之后，手动触发一次并打开 bootstrap：
+
+```bash
+gh workflow run select_xray_links -R <owner>/<repo> --ref master -f bootstrap=true
+```
+
+这次会建空库，拉取全部订阅源并去重，能解析的链接先记为 `pending`，再在约 5 小时预算内探测。没测到的保持 `pending`，不会记成失败。跑完并校验通过后，会新建一个 `run-<UTC时间>-<run_id>-<attempt>` Release，然后才把它标成 Latest。
+
+之后的定时运行不要再打开 bootstrap。它们只恢复最新一份合格的本纪元快照；这份不合格就往前找更早的合格 Release。一份都没有就失败退出，不会自动空库，也不会读 Artifact。
+
+定时表达式是每小时的 0 分。这和每小时一次的含义相同，不保证 GitHub 调度器一定会投递。
+
+## 输出文件说明（每个成功运行自己的 Release，不覆盖旧附件）
 
 | 文件 | 内容说明 | 含敏感链接凭据 |
 |---|---|---|
@@ -60,7 +76,7 @@ python3 export.py --db data/state.sqlite continuous --days 5 --end-day 2026-11-1
 1. **为什么默认固定单一测量端点 `https://checkip.amazonaws.com` 且不做跨源静默回退**：
    - 代理节点返回的出口 IP 是**对特定目标测量端点观测到的出口 IP**，并非全网所有目标恒定不变的唯一物理 IP。
    - 例如，根据 [Cloudflare Workers TCP Sockets 官方文档](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)，Workers 出站 TCP socket 限制直连 Cloudflare IP 段；常见基于 Workers 的 VLESS 实现（如 [`zizifn/edgetunnel`](https://github.com/zizifn/edgetunnel/blob/main/src/worker-vless.js)）在直连目标无数据时通常会回退走配置的 `proxyIP` 中继。在这类节点配置下，请求 Cloudflare 前置端点（如 `api.ipify.org`）可能走 `proxyIP` 中继，而请求非 Cloudflare 前置目标（如 `https://checkip.amazonaws.com`）时则可能走不同的出站路径（但这取决于节点具体后端实现，不代表所有请求或访问 GitHub / YouTube / X 时必然固定走某一条路径）。
-   - 为保证统计口径前后一致，本项目默认采用 `https://checkip.amazonaws.com`（可通过 `IP_CHECK_URL` 配置），默认关闭跨源隐式回退（`IP_FALLBACK_URLS=""`），并在数据库与报表中记录完整的规范化测量端点 URI `ip_source`（自动剥离 URL 凭据）与 `ip_version`（`ipv4`/`ipv6`），确保不同测量端点或不同协议栈的观测结果不会静默混入同一连续性序列。
+   - 本项目只使用一个测量端点，默认 `https://checkip.amazonaws.com`（`IP_CHECK_URL`），地址族默认 IPv4（`IP_FAMILY=4`）。观测结果记的是「这个端点看到的出口地址」，不表示访问 GitHub、YouTube、X 或其他网站时一定是同一个 IP。数据库里的 `ip_source` 是去掉账号密码后的完整端点 URI，不同端点或 IPv4/IPv6 不会混进同一条连续统计。
 2. **严格响应校验与失败分类**：
    - 使用标准库 `ipaddress.ip_address` 校验返回内容必须为单个合法公网 IP（`is_global=True`），拒绝多 IP/多行（如未过滤的 `X-Forwarded-For` 列表）、内网/保留地址、HTML 错误页及不匹配的地址族。
    - 严格区分“连通性探针失败（`reason=917`）”与“代理已连通但出口 IP 获取失败（`reason=ip_http`/`ip_invalid`/`ip_family`）”；失败观测绝不绑定陈旧的 `exit_ip`。
