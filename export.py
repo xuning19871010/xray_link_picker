@@ -48,10 +48,17 @@ def stable_threshold(
     stable_days: int = 30,
     now_ts: float | None = None,
 ) -> int:
-    """保持旧版兼容：第 N 天门槛=N，直到 STABLE_DAYS（基于 links.last_ok_day 的 UTC 日期）。"""
-    row = conn.execute(
-        "SELECT MIN(last_ok_day) FROM links WHERE last_ok_day IS NOT NULL"
-    ).fetchone()
+    """第 N 天门槛=N，直到 STABLE_DAYS（优先按新权威观测源起算，避免旧 legacy_mixed 历史把新源首日门槛直接拉满）。"""
+    has_src = _has_column(conn, "links", "ip_source")
+    row = None
+    if has_src:
+        row = conn.execute(
+            "SELECT MIN(last_ok_day) FROM links WHERE last_ok_day IS NOT NULL AND (ip_source IS NULL OR ip_source != 'legacy_mixed')"
+        ).fetchone()
+    if not row or not row[0]:
+        row = conn.execute(
+            "SELECT MIN(last_ok_day) FROM links WHERE last_ok_day IS NOT NULL"
+        ).fetchone()
     if not row or not row[0]:
         return 1
     try:
@@ -91,16 +98,36 @@ def select_representative_goods(conn: sqlite3.Connection) -> list[tuple[str, str
 def select_representative_stables(
     conn: sqlite3.Connection, need_days: int
 ) -> list[tuple[str, str]]:
-    """导出策略：ok_days >= need_days 且有出口 IP，同 IP 留 ok_days 高、updated_at 新、h 字典序小。"""
-    rows = conn.execute(
-        """
-        SELECT link, exit_ip
-        FROM links
-        WHERE ok_days >= ? AND exit_ip IS NOT NULL AND exit_ip != ''
-        ORDER BY ok_days DESC, updated_at DESC, h ASC
-        """,
-        (need_days,),
-    ).fetchall()
+    """导出策略：ok_days >= need_days 且有出口 IP，优先选非 legacy_mixed 的当前权威观测源链接。"""
+    has_src = _has_column(conn, "links", "ip_source")
+    has_canonical = False
+    if has_src:
+        has_canonical = bool(
+            conn.execute(
+                "SELECT 1 FROM links WHERE status='good' AND ip_source IS NOT NULL AND ip_source != 'legacy_mixed' LIMIT 1"
+            ).fetchone()
+        )
+    if has_src and has_canonical:
+        rows = conn.execute(
+            """
+            SELECT link, exit_ip
+            FROM links
+            WHERE ok_days >= ? AND exit_ip IS NOT NULL AND exit_ip != ''
+              AND (ip_source IS NULL OR ip_source != 'legacy_mixed')
+            ORDER BY ok_days DESC, updated_at DESC, h ASC
+            """,
+            (need_days,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT link, exit_ip
+            FROM links
+            WHERE ok_days >= ? AND exit_ip IS NOT NULL AND exit_ip != ''
+            ORDER BY ok_days DESC, updated_at DESC, h ASC
+            """,
+            (need_days,),
+        ).fetchall()
     seen_ip: set[str] = set()
     out: list[tuple[str, str]] = []
     for link, ip in rows:

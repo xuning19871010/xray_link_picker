@@ -85,6 +85,22 @@ class TestIpTrackingAndQueries(unittest.TestCase):
         # 不从旧计数器伪造历史每日记录
         hist_cnt = conn.execute("SELECT COUNT(*) FROM daily_ip_links").fetchone()[0]
         self.assertEqual(hist_cnt, 0)
+
+        # 当旧 legacy_mixed 链接在新权威源 checkip.amazonaws.com 下复测成功时，ok_days 从 1 重新起算，不混入旧源 streak
+        t_next = ts_shanghai(2026, 11, 2, 10, 0)
+        rk = storage.begin_run(conn, run_id="101", started_at=t_next)
+        storage.record_probe_batch(
+            conn,
+            rk,
+            [storage.ProbeRecord(l1, "good", "54.230.1.99", "ok", t_next + 1, "retest", 1)],
+        )
+        storage.end_run(conn, rk, "completed", ended_at=t_next + 5)
+        new_row = conn.execute(
+            "SELECT exit_ip, ip_source, ok_days, last_ok_day FROM links WHERE h=?",
+            (storage.link_hash(l1),),
+        ).fetchone()
+        self.assertEqual(new_row, ("54.230.1.99", "checkip.amazonaws.com", 1, "2026-11-02"))
+        self.assertEqual(export.stable_threshold(conn, now_ts=t_next + 5), 1)
         conn.close()
 
         # 第二次打开幂等无异常

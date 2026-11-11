@@ -442,11 +442,18 @@ def end_run(
 
 
 def _bump_ok_days_legacy_utc(
-    prev_ok_days: int, prev_last_ok_day: str | None, ts: float
+    prev_ok_days: int,
+    prev_last_ok_day: str | None,
+     ts: float,
+    *,
+    prev_ip_source: str | None = None,
+    new_ip_source: str | None = None,
 ) -> tuple[int, str]:
-    """保持与旧版一致的 UTC 口径单链接连续天数累加。"""
+    """计算单链接连续成功天数（UTC 口径）；若观测源发生变化（如从 legacy_mixed 切换到 checkip.amazonaws.com），从 1 重新起算。"""
     d = utc_day(ts)
     today_s = d.isoformat()
+    if prev_ip_source and new_ip_source and prev_ip_source != new_ip_source:
+        return 1, today_s
     yesterday_s = (d - timedelta(days=1)).isoformat()
     ok_days = prev_ok_days or 0
     if prev_last_ok_day == today_s:
@@ -538,7 +545,7 @@ def record_probe_batch(
 
             # 1) 更新 links 当前状态（仅当观测时间戳 >= 已有 updated_at 时覆盖当前状态）
             prev = conn.execute(
-                "SELECT ok_days, last_ok_day, first_seen_at, updated_at FROM links WHERE h=?",
+                "SELECT ok_days, last_ok_day, first_seen_at, updated_at, ip_source FROM links WHERE h=?",
                 (h,),
             ).fetchone()
             first_seen = prev[2] if (prev and prev[2] is not None) else rec.ts
@@ -548,6 +555,8 @@ def record_probe_batch(
                     prev[0] if prev else 0,
                     prev[1] if prev else None,
                     rec.ts,
+                    prev_ip_source=prev[4] if prev else None,
+                    new_ip_source=obs_src,
                 )
                 conn.execute(
                     """
