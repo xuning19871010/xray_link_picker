@@ -22,8 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 只恢复带本纪元标记、校验通过、且已完成发布的 Release。
-      # 旧 Release / Artifact 一律不读。没有合格快照时，只有手动 bootstrap=true 才允许空库。
+      # 先看 epoch.txt。没有或不属于本纪元的 Release 是档案，不去对校验和。
+      # 本纪元文件对不上时是 broken，禁止 bootstrap。ops-* 只放隧道地址，永远不是数据库快照。
       - name: restore new-epoch state.sqlite
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,19 +39,32 @@ jobs:
             pre="$3"
             rm -rf /tmp/restore
             mkdir -p /tmp/restore
-            if ! gh release download "$tag" -R "$REPO" \
-              -p epoch.txt -p state.sqlite -p state.sqlite.sha256 -D /tmp/restore; then
-              echo "skip $tag: missing epoch snapshot assets"
-              return 1
+            case "$tag" in
+              ops-*)
+                echo "skip $tag: operational tunnel release (checksum not checked)"
+                echo archive > /tmp/restore-class
+                return 0
+                ;;
+            esac
+            if ! gh release download "$tag" -R "$REPO" -p epoch.txt -D /tmp/restore; then
+              echo "skip $tag: no epoch.txt (archive, checksum not checked)"
+              echo archive > /tmp/restore-class
+              return 0
             fi
-            if ! (cd /tmp/restore && sha256sum -c state.sqlite.sha256); then
-              echo "skip $tag: checksum mismatch"
-              return 1
+            got=$(tr -d '[:space:]' < /tmp/restore/epoch.txt)
+            want=$(python3 -c 'import storage; print(storage.EPOCH)')
+            if [ "$got" != "$want" ]; then
+              echo "skip $tag: epoch '$got' is not $want (archive, checksum not checked)"
+              echo archive > /tmp/restore-class
+              return 0
             fi
-            if ! python3 -c 'import storage,sys; from pathlib import Path; draft,pre=sys.argv[1],sys.argv[2]; ok=storage.release_restorable(epoch_text=Path("/tmp/restore/epoch.txt").read_text(encoding="utf-8"), checksum_ok=True, is_prerelease=(pre=="true"), is_draft=(draft=="true")) and storage.db_is_current_epoch(Path("/tmp/restore/state.sqlite")); sys.exit(0 if ok else 1)' "$draft" "$pre"; then
-              echo "skip $tag: epoch or database rejected"
-              return 1
+            if ! gh release download "$tag" -R "$REPO" -p state.sqlite -p 'state.sqlite.sha256' -D /tmp/restore; then
+              echo "ERROR $tag: current epoch but state.sqlite or checksum is missing"
+              echo broken > /tmp/restore-class
+              return 0
             fi
+            python3 -c 'import storage,sys; from pathlib import Path; print(storage.classify_snapshot(Path("/tmp/restore"), is_draft=sys.argv[1]=="true", is_prerelease=sys.argv[2]=="true"))' "$draft" "$pre" > /tmp/restore-class
+            echo "classify $tag -> $(cat /tmp/restore-class)"
           }
 
           if ! candidates=$(gh release list -R "$REPO" --limit 100 \
@@ -61,22 +74,32 @@ jobs:
             exit 1
           fi
           restored=0
+          broken=0
           while IFS=$'\t' read -r tag draft pre; do
             [ -n "${tag:-}" ] || continue
-            if try_tag "$tag" "$draft" "$pre"; then
+            try_tag "$tag" "$draft" "$pre"
+            status=$(cat /tmp/restore-class)
+            if [ "$status" = "restorable" ]; then
               cp /tmp/restore/state.sqlite data/state.sqlite
               echo "restored new-epoch snapshot from $tag"
               restored=1
               break
             fi
+            if [ "$status" = "broken" ]; then
+              broken=1
+            fi
           done <<< "$candidates"
 
           if [ "$restored" != 1 ]; then
+            if [ "$broken" = 1 ]; then
+              echo "ERROR: 找到本纪元快照但校验失败。拒绝 bootstrap，避免把已有新库换成空库。"
+              exit 1
+            fi
             if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bootstrap }}" = "true" ]; then
-              echo "bootstrap: no valid new-epoch release, starting from an empty database"
+              echo "bootstrap: no current-epoch release, starting from an empty database"
               exit 0
             fi
-            echo "ERROR: 没有可用的新纪元快照。定时运行不会改用旧 Release/Artifact，也不会自动建空库。首次请手动 workflow_dispatch 且 bootstrap=true。"
+            echo "ERROR: 没有可用的新纪元快照。不会读旧 Release/Artifact，也不会自动建空库。"
             exit 1
           fi
 
@@ -95,22 +118,25 @@ jobs:
           tar -xzf /tmp/sb.tar.gz -C /tmp
           sudo install -m 755 /tmp/sing-box-${SB_VER}-linux-amd64/sing-box /usr/local/bin/sing-box
           sudo mkdir -p /run/sshd
-          printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf
+          printf 'PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf >/dev/null
           echo "root:${RUNNER_SSH_PASSWORD}" | sudo chpasswd
           sudo /usr/sbin/sshd
           curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           sudo chmod +x /usr/local/bin/cloudflared
-          cloudflared tunnel --no-autoupdate --url tcp://localhost:22 > /tmp/cf.log 2>&1 &
+          # 新会话启动，避免步骤结束时随 shell 进程组一起退出。密码不打印。
+          : > /tmp/cf.log
+          RUNNER_TRACKING_ID= setsid nohup /usr/local/bin/cloudflared tunnel --no-autoupdate --url tcp://localhost:22 >>/tmp/cf.log 2>&1 </dev/null &
           for i in $(seq 1 30); do
             URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
             [ -n "$URL" ] && break
             sleep 1
           done
-          echo "CF_SSH_URL=$URL"
-          echo "CF_SSH_HOST=${URL#https://}"
-          echo "SSH 登录方式: cloudflared access tcp --hostname ${URL#https://} --url localhost:2222"
-          echo "然后另开终端: ssh -p 2222 root@127.0.0.1"
-          echo "密码: 使用仓库 Secret RUNNER_SSH_PASSWORD（即你提供的那组密码，不在日志中打印）"
+          echo "CF_SSH_URL=${URL:-}"
+          if [ -n "${URL:-}" ]; then
+            HOST="${URL#https://}"
+            echo "SSH_CMD=ssh -o ProxyCommand='cloudflared access tcp --hostname ${HOST}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${HOST}"
+          fi
+          echo "ssh auth is existing root password secret RUNNER_SSH_PASSWORD; password is not printed; no client key is installed"
 
       - name: select links
         env:
@@ -120,15 +146,68 @@ jobs:
           TARGET_GOOD: "0"
           DEBUG_MAX_CANDIDATES: "0"
           PROGRESS_FILE: data/progress.txt
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_SSH_PASSWORD: ${{ secrets.RUNNER_SSH_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
+          REPO="${{ github.repository }}"
           mkdir -p data
-          python3 -u select_links.py &
+          if ! pgrep -x sshd >/dev/null 2>&1; then
+            echo "sshd was not alive at select-links start; starting it in this step"
+            sudo mkdir -p /run/sshd
+            printf 'PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf >/dev/null
+            echo "root:${RUNNER_SSH_PASSWORD}" | sudo chpasswd
+            sudo /usr/sbin/sshd
+          fi
+          if ! pgrep -x cloudflared >/dev/null 2>&1; then
+            echo "cloudflared was not alive at select-links start; starting it in this step"
+            : > /tmp/cf.log
+            RUNNER_TRACKING_ID= setsid nohup /usr/local/bin/cloudflared tunnel --no-autoupdate --url tcp://localhost:22 >>/tmp/cf.log 2>&1 </dev/null &
+          fi
+          echo "tunnel_alive_at_select_start sshd=$(pgrep -xc sshd || true) cloudflared=$(pgrep -xc cloudflared || true)"
+
+          publish_tunnel() {
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            echo "CF_SSH_URL=${URL:-}"
+            if [ -z "${URL:-}" ]; then
+              echo "SSH_CMD=waiting for cloudflared hostname"
+              return 0
+            fi
+            HOST="${URL#https://}"
+            CMD="ssh -o ProxyCommand='cloudflared access tcp --hostname ${HOST}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${HOST}"
+            echo "SSH_CMD=$CMD"
+            printf '%s\n%s\n' "$URL" "$CMD" > /tmp/ssh-access.txt
+            if [ "${URL}" = "${PUBLISHED_URL:-}" ]; then
+              return 0
+            fi
+            TAG=$(python3 -c 'import os,storage; print(storage.ops_release_tag(os.environ["GITHUB_RUN_ID"], os.environ.get("GITHUB_RUN_ATTEMPT","1")))')
+            if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+              gh release upload "$TAG" /tmp/ssh-access.txt --clobber -R "$REPO" || echo "WARN: ops tunnel upload failed"
+            else
+              gh release create "$TAG" -R "$REPO" --prerelease --title "ops tunnel $TAG" \
+                --notes "operational tunnel address only. not a database snapshot. no epoch.txt. not restorable." \
+                /tmp/ssh-access.txt || echo "WARN: ops tunnel release create failed"
+            fi
+            PUBLISHED_URL="$URL"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s\n' "$URL" '```' "$CMD" '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          }
+
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+          publish_tunnel
+
+          python3 -u select_links.py > data/select.log 2>&1 &
           PID=$!
           while kill -0 $PID 2>/dev/null; do
             echo "---- $(date -u +%H:%M:%S) ----"
-            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
-            echo "CF_SSH_URL=$URL"
+            echo "tunnel_alive sshd=$(pgrep -xc sshd || true) cloudflared=$(pgrep -xc cloudflared || true)"
+            publish_tunnel
+            tail -5 data/select.log 2>/dev/null || true
             tail -5 data/progress.txt 2>/dev/null || true
             uptime
             sleep 45
@@ -144,8 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
-          python3 -c 'import storage; open("data/epoch.txt","w",encoding="utf-8").write(storage.EPOCH+"\n")'
-          sha256sum data/state.sqlite > data/state.sqlite.sha256
+          python3 -c 'from pathlib import Path; import storage; storage.write_sqlite_sha256(Path("data/state.sqlite"), Path("data/state.sqlite.sha256")); Path("data/epoch.txt").write_text(storage.EPOCH+"\n", encoding="utf-8")'
           TAG=$(python3 -c 'import os,storage; print(storage.release_tag(os.environ["GITHUB_RUN_ID"], os.environ.get("GITHUB_RUN_ATTEMPT","1")))')
           COUNTS=$(python3 -c "import sqlite3; c=sqlite3.connect('data/state.sqlite'); print(' '.join('%s=%s' % (st, c.execute('SELECT COUNT(*) FROM links WHERE status=?', (st,)).fetchone()[0]) for st in ('good','pending','failed')))")
           NOTE="epoch=$(python3 -c 'import storage; print(storage.EPOCH)')
@@ -169,7 +247,6 @@ jobs:
           rm -rf /tmp/verify
           mkdir -p /tmp/verify
           gh release download "$TAG" -R "$REPO" -p epoch.txt -p state.sqlite -p state.sqlite.sha256 -D /tmp/verify
-          (cd /tmp/verify && sha256sum -c state.sqlite.sha256)
-          python3 -c 'import storage; from pathlib import Path; assert open("/tmp/verify/epoch.txt",encoding="utf-8").read().strip()==storage.EPOCH; assert storage.db_is_current_epoch(Path("/tmp/verify/state.sqlite"))'
+          python3 -c 'import storage,sys; from pathlib import Path; sys.exit(0 if storage.classify_snapshot(Path("/tmp/verify"), is_draft=False, is_prerelease=True)=="restorable" else 1)'
           gh release edit "$TAG" -R "$REPO" --prerelease=false --latest
           echo "published $TAG and marked latest"

@@ -14,7 +14,17 @@ gh workflow run select_xray_links -R <owner>/<repo> --ref master -f bootstrap=tr
 
 这次会建空库，拉取全部订阅源并去重，能解析的链接先记为 `pending`，再在约 5 小时预算内探测。没测到的保持 `pending`，不会记成失败。跑完并校验通过后，会新建一个 `run-<UTC时间>-<run_id>-<attempt>` Release，然后才把它标成 Latest。
 
-之后的定时运行不要再打开 bootstrap。它们只恢复最新一份合格的本纪元快照；这份不合格就往前找更早的合格 Release。一份都没有就失败退出，不会自动空库，也不会读 Artifact。
+恢复时先看有没有本纪元的 `epoch.txt`。没有纪元标记的旧 Release 直接跳过，不去对校验和。有本纪元标记但 `state.sqlite` 对不上时，任务失败，不会 bootstrap 成空库。`ops-<run_id>-<attempt>` 只放隧道地址，没有 `epoch.txt`，不能当数据库恢复。
+
+探测开始后，协调者可以用下面这条命令拿到登录地址（文件里没有密码）：
+
+```bash
+gh release download "ops-<run_id>-<attempt>" -R <owner>/<repo> -p ssh-access.txt -O -
+```
+
+登录账号是 root，密码是仓库里原有的 `RUNNER_SSH_PASSWORD`，日志和这个文件都不打印密码。这条命令不带 `-i`，因为 runner 上没有配对的客户端私钥。
+
+之后的定时运行不要再打开 bootstrap。它们只恢复校验通过的本纪元快照。一份都没有就失败退出，不会自动空库，也不会读 Artifact。
 
 定时表达式是每小时的 0 分。这和每小时一次的含义相同，不保证 GitHub 调度器一定会投递。
 

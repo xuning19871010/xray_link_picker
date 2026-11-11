@@ -82,7 +82,7 @@ class TestIpTrackingAndQueries(unittest.TestCase):
         """预发布/草稿/旧纪元/校验失败不能恢复；未探测保持 pending。"""
         ok = dict(epoch_text=storage.EPOCH + "\n", checksum_ok=True, is_prerelease=False, is_draft=False)
         self.assertTrue(storage.release_restorable(**ok))
-        self.assertFalse(storage.release_restorable(**{**ok, "is_prerelease": True}))
+        self.assertTrue(storage.release_restorable(**{**ok, "is_prerelease": True}))
         self.assertFalse(storage.release_restorable(**{**ok, "is_draft": True}))
         self.assertFalse(storage.release_restorable(**{**ok, "checksum_ok": False}))
         self.assertFalse(storage.release_restorable(**{**ok, "epoch_text": "legacy"}))
@@ -469,6 +469,49 @@ class TestIpTrackingAndQueries(unittest.TestCase):
         )
         self.assertIn("--prerelease", text)
         self.assertNotIn("gh release upload latest", text)
+        self.assertIn("ops-", text)
+        self.assertIn("classify_snapshot", text)
+        self.assertIn("checksum not checked", text)
+
+    def test_12_checksum_path_and_epoch_order(self) -> None:
+        """清单里的 data/state.sqlite 按文件名核对；没有纪元时不把路径错误当成坏快照。"""
+        conn = storage.open_db(self.db_path)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        checksum = self.dir / "state.sqlite.sha256"
+        storage.write_sqlite_sha256(self.db_path, checksum)
+        self.assertNotIn("data/", checksum.read_text(encoding="utf-8"))
+
+        download = self.dir / "dl"
+        download.mkdir()
+        (download / "state.sqlite").write_bytes(self.db_path.read_bytes())
+        (download / "epoch.txt").write_text(storage.EPOCH + "\n", encoding="utf-8")
+        digest = checksum.read_text(encoding="utf-8").split()[0]
+        (download / "state.sqlite.sha256").write_text(
+            f"{digest}  data/state.sqlite\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            storage.classify_snapshot(download, is_draft=False, is_prerelease=True),
+            "restorable",
+        )
+
+        old = self.dir / "old-latest"
+        old.mkdir()
+        (old / "state.sqlite").write_bytes(b"legacy")
+        (old / "state.sqlite.sha256").write_text(f"{digest}  data/state.sqlite\n", encoding="utf-8")
+        self.assertEqual(
+            storage.classify_snapshot(old, is_draft=False, is_prerelease=False),
+            "archive",
+        )
+        self.assertTrue(storage.allow_empty_bootstrap(["archive"]))
+
+        (download / "state.sqlite.sha256").write_text("0" * 64 + "  state.sqlite\n", encoding="utf-8")
+        self.assertEqual(
+            storage.classify_snapshot(download, is_draft=False, is_prerelease=False),
+            "broken",
+        )
+        self.assertFalse(storage.allow_empty_bootstrap(["archive", "broken"]))
+        self.assertEqual(storage.ops_release_tag("42957190275", 1), "ops-42957190275-1")
 
 
 if __name__ == "__main__":

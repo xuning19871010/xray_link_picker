@@ -197,9 +197,69 @@ def db_is_current_epoch(db_path: Path) -> bool:
     return read_epoch(db_path) == EPOCH
 
 
+def write_sqlite_sha256(sqlite_path: Path, checksum_path: Path) -> None:
+    """校验和只写文件名，不写 data/ 前缀。下载目录里的文件名就是 state.sqlite。"""
+    digest = hashlib.sha256(sqlite_path.read_bytes()).hexdigest()
+    checksum_path.write_text(f"{digest}  {sqlite_path.name}\n", encoding="utf-8")
+
+
+def verify_sqlite_sha256(checksum_path: Path, directory: Path) -> tuple[bool, str]:
+    """按下载目录里的文件名核对。清单写成 data/state.sqlite 时也只取最后一段文件名。"""
+    if not checksum_path.is_file():
+        return False, "missing_checksum"
+    lines = [ln for ln in checksum_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if not lines:
+        return False, "empty_checksum"
+    parts = lines[0].split()
+    if len(parts) < 2:
+        return False, "bad_checksum_line"
+    digest, listed = parts[0], parts[-1]
+    target = directory / Path(listed).name
+    if not target.is_file():
+        return False, f"missing_file:{listed}"
+    actual = hashlib.sha256(target.read_bytes()).hexdigest()
+    if actual.lower() != digest.lower():
+        return False, "hash_mismatch"
+    return True, "ok"
+
+
+def classify_snapshot(directory: Path, *, is_draft: bool, is_prerelease: bool) -> str:
+    """先看纪元，再看校验和。返回 restorable、archive 或 broken。
+
+    archive：没有本纪元标记（旧 Release、ops 隧道发布、草稿）。不读校验和。
+    broken：有本纪元标记，但校验和或库内容对不上。禁止当成“没有快照”去 bootstrap。
+    restorable：纪元、校验和、库内容都通过。预发布只要这三项通过也可以恢复。
+    """
+    del is_prerelease  # 完整性通过即可恢复；半截上传会在校验和处变成 broken
+    if is_draft:
+        return "archive"
+    epoch_file = directory / "epoch.txt"
+    if not epoch_file.is_file():
+        return "archive"
+    if epoch_file.read_text(encoding="utf-8").strip() != EPOCH:
+        return "archive"
+    ok, _reason = verify_sqlite_sha256(directory / "state.sqlite.sha256", directory)
+    if not ok:
+        return "broken"
+    if not db_is_current_epoch(directory / "state.sqlite"):
+        return "broken"
+    return "restorable"
+
+
+def allow_empty_bootstrap(statuses: list[str]) -> bool:
+    """只有全部都是 archive（或一个都没有）才允许空库。出现 broken 或 restorable 都不行。"""
+    return not any(status in ("broken", "restorable") for status in statuses)
+
+
+def ops_release_tag(run_id: str, run_attempt: int | str) -> str:
+    rid = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in str(run_id)) or "local"
+    return f"ops-{rid}-{int(run_attempt)}"
+
+
 def release_restorable(*, epoch_text: str, checksum_ok: bool, is_prerelease: bool, is_draft: bool) -> bool:
-    """只有校验通过、非草稿、非预发布、且纪元匹配的 Release 才能用于恢复。"""
-    return (not is_prerelease) and (not is_draft) and bool(checksum_ok) and epoch_text.strip() == EPOCH
+    """草稿不能恢复。预发布只要纪元和校验和已经通过，就不是半截文件。"""
+    del is_prerelease
+    return (not is_draft) and bool(checksum_ok) and epoch_text.strip() == EPOCH
 
 
 def release_tag(run_id: str, run_attempt: int | str, ts: float | None = None) -> str:
