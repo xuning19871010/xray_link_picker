@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """选可用 xray 分享链接（Actions runner 上跑）。
 
-三份结果：
-  data/good_links.txt          — 当次测通 + 出口 IP 不重复
-  data/stable_links.txt        — 连续成功跑日 streak（探测不通清零；IP 撞车只挤出 good，
-                                 保留 ok_days + 出口 IP）；门槛爬升到 STABLE_DAYS；
-                                 导出时出口 IP 也互不相同（同 IP 留 streak 更高/更新的）
+输出文件（data/ 目录）：
+  data/good_links.txt          — 当次可用代表链接（每个出口 IP 选 1 条代表，出口 IP 不重复）
+  data/failed_links.txt        — 当前状态为 failed 的链接
+  data/stable_links.txt        — 连续成功跑日 streak 达标的代表链接（出口 IP 互不相同）
   data/stable_links_by_ip.txt  — 与 stable 同集，每行「出口IP 空格 xray_link」，按出口 IP 排序
+  data/ip_day_counts.csv       — 每日每出口 IP（含 ip_source/ip_version）对应的真实 DISTINCT 成功链接数
+  data/ip_summary.csv          — 每个出口 IP 序列跨日观测汇总（连续天数、累计不同链接数等）
+  data/collection_days.csv     — 每日采集轮次与观测覆盖汇总
+  data/ip_report.html          — 单文件静态交互报表（搜索/排序/分页，不含敏感链接）
 
-主流程还会：
-  - 复测掉线 good 后，对空出出口 IP 做撞车顶替（failed 且仍带 exit_ip）
-  - 对冷却期满的普通 failed 做有界重试（默认 7 天、每轮最多 2500）
-
-TARGET_GOOD=0 表示不设上限，把候选测完拿多少算多少。
+出口 IP 测量说明：
+  - 默认使用非 Cloudflare 前置的权威 HTTPS IPv4 端点 https://checkip.amazonaws.com（可通过 IP_CHECK_URL 配置）
+  - 默认关闭跨源隐式回退（IP_FALLBACK_URLS 默认为空），避免 Cloudflare 前置端点（如 api.ipify.org 触发
+    Cloudflare Workers 节点 proxyIP 回退中继）与非 CF 端点（观测到 Workers 原生出站）静默混入同一连续序列
+  - 每条观测均记录 ip_source 与 ip_version（ipv4/ipv6），并严格校验返回值为单个合法公网 IP
 """
 from __future__ import annotations
 
 import base64
-import hashlib
-import ipaddress
 import json
 import os
 import random
@@ -31,39 +32,58 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
 from pathlib import Path
 
+from export import export_all, stable_threshold
 from link_parse import parse_link
+from storage import (
+    ProbeRecord,
+    begin_run,
+    end_run,
+    extract_ip_source,
+    link_hash,
+    normalize_link,
+    open_db,
+    parse_and_validate_exit_ip,
+    purge_old_observations,
+    record_probe_batch,
+)
 
 # ---------- 路径与参数（可用环境变量覆盖）----------
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DB = DATA / "state.sqlite"
-GOOD_TXT = DATA / "good_links.txt"       # 当次 good
+GOOD_TXT = DATA / "good_links.txt"
 FAILED_TXT = DATA / "failed_links.txt"
-STABLE_TXT = DATA / "stable_links.txt"   # 持续可用
-STABLE_BY_IP_TXT = DATA / "stable_links_by_ip.txt"  # 出口IP + link，按 IP 排序
+STABLE_TXT = DATA / "stable_links.txt"
+STABLE_BY_IP_TXT = DATA / "stable_links_by_ip.txt"
 PROGRESS_FILE = Path(os.environ.get("PROGRESS_FILE", str(DATA / "progress.txt")))
 
-TARGET = int(os.environ.get("TARGET_GOOD", "0"))           # 0=不设上限，测完为止
+TARGET = int(os.environ.get("TARGET_GOOD", "0"))           # 0=不设上限，测完为止（按唯一出口 IP 计）
 STABLE_DAYS = int(os.environ.get("STABLE_DAYS", "30"))     # streak 满多少天算「满额」stable
 WORKERS_MAX = int(os.environ.get("WORKERS_MAX", "384"))
 WORKERS_MIN = int(os.environ.get("WORKERS_MIN", "256"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3"))
 PROBE_URL = os.environ.get("PROBE_URL", "http://43.130.11.12:917/917")
+
+# 出口 IP 测量配置：默认单一非 CF 权威端点 https://checkip.amazonaws.com，不做跨源隐式回退
+IP_CHECK_URL = os.environ.get("IP_CHECK_URL", "https://checkip.amazonaws.com").strip()
+IP_FALLBACK_URLS = [
+    u.strip()
+    for u in os.environ.get("IP_FALLBACK_URLS", "").split(",")
+    if u.strip()
+]
+IP_FAMILY = os.environ.get("IP_FAMILY", "4").strip()  # "4" | "6" | "any"
+
 XRAY_BIN = os.environ.get("XRAY_BIN", "xray")
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
-# 调试：只测前 N 条候选（0=不限制）。快速验证流程用 300～1000。
-DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "0"))  # 0=不截断
-# 撞车顶替：good 掉线后，重试同 exit_ip 的 failed（曾测通但被挤掉）
+DEBUG_MAX_CANDIDATES = int(os.environ.get("DEBUG_MAX_CANDIDATES", "0"))
 COLLISION_RETRY_ENABLE = int(os.environ.get("COLLISION_RETRY_ENABLE", "1"))
 COLLISION_RETRY_PER_IP = int(os.environ.get("COLLISION_RETRY_PER_IP", "2"))
-# 冷却重试：普通 failed（无 exit_ip）过期后再测一小批
 RETRY_FAILED_ENABLE = int(os.environ.get("RETRY_FAILED_ENABLE", "1"))
 RETRY_AFTER_DAYS = float(os.environ.get("RETRY_AFTER_DAYS", "7"))
 RETRY_FAILED_MAX = int(os.environ.get("RETRY_FAILED_MAX", "2500"))
-RETRY_PROBE_TIMEOUT = float(os.environ.get("RETRY_PROBE_TIMEOUT", "5"))  # 仅冷却重试
+RETRY_PROBE_TIMEOUT = float(os.environ.get("RETRY_PROBE_TIMEOUT", "5"))
 
 SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/all.txt",
@@ -94,18 +114,12 @@ SUBSCRIBE_URLS = [
     "https://raw.githubusercontent.com/ZywChannel/free/main/sub",
     "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/vless.txt",
 ]
-IP_URLS = [
-    "https://api.ipify.org",
-    "https://ifconfig.me/ip",
-    "https://icanhazip.com",
-    "https://ident.me",
-]
+
 LINK_RE = re.compile(
     r"(?:vmess|vless|trojan|ss|ssr|hysteria2|hy2|hysteria|tuic|anytls|"
     r"wireguard|socks5|socks|https|http)://[^\s<>\"']+"
 )
 
-_lock = threading.Lock()
 _port_lock = threading.Lock()
 _next_port = 20000
 
@@ -114,18 +128,19 @@ def log(msg: str) -> None:
     print(msg, flush=True)
     try:
         PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(PROGRESS_FILE, "a") as f:
+        with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
             f.write(time.strftime("%H:%M:%S ") + msg + "\n")
     except Exception:
         pass
 
 
-def link_hash(link: str) -> str:
-    return hashlib.sha256(link.strip().encode()).hexdigest()
-
-
-# ---------- 拉订阅 ----------
-def http_get(url: str, timeout: float = 20, proxy: str | None = None) -> bytes:
+# ---------- 拉订阅与代理请求 ----------
+def http_get(
+    url: str,
+    timeout: float = 20,
+    proxy: str | None = None,
+    ip_family: str | None = None,
+) -> bytes:
     """直连用 urllib；走 SOCKS 必须用 curl（系统 urllib 不带 SOCKS）。"""
     if not proxy:
         req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
@@ -134,8 +149,13 @@ def http_get(url: str, timeout: float = 20, proxy: str | None = None) -> bytes:
     hostport = proxy.split("://", 1)[-1]
     cmd = [
         "curl", "-fsS", "--max-time", str(int(timeout)),
-        "--socks5-hostname", hostport, "-A", "curl/8.0", url,
+        "--socks5-hostname", hostport, "-A", "curl/8.0",
     ]
+    if ip_family in ("4", "ipv4"):
+        cmd.append("-4")
+    elif ip_family in ("6", "ipv6"):
+        cmd.append("-6")
+    cmd.append(url)
     r = subprocess.run(cmd, capture_output=True, timeout=timeout + 2)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.decode(errors="ignore")[:200] or f"curl {r.returncode}")
@@ -167,7 +187,7 @@ def fetch_candidates() -> list[str]:
         if "://" not in body[:500]:
             body = maybe_b64_decode(raw)
         for m in LINK_RE.findall(body):
-            link = m.strip().rstrip("\",'")
+            link = normalize_link(m)
             if link not in seen:
                 seen.add(link)
                 out.append(link)
@@ -179,159 +199,29 @@ def fetch_candidates() -> list[str]:
     return out
 
 
-# ---------- 数据库 ----------
+# ---------- 数据库与导出辅助 ----------
 def db_connect() -> sqlite3.Connection:
-    DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB, check_same_thread=False)
-    # status: good=当次可用 failed=当次失败
-    # ok_days: 跨天累计成功跑日数；last_ok_day: 最近一次成功日期 YYYY-MM-DD
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS links(
-            h TEXT PRIMARY KEY,
-            link TEXT NOT NULL,
-            status TEXT NOT NULL,
-            exit_ip TEXT,
-            ok_days INTEGER NOT NULL DEFAULT 0,
-            last_ok_day TEXT,
-            updated_at REAL NOT NULL
-        )"""
-    )
-    # 旧库升级：缺列就补
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(links)")}
-    if "ok_days" not in cols:
-        conn.execute("ALTER TABLE links ADD COLUMN ok_days INTEGER NOT NULL DEFAULT 0")
-    if "last_ok_day" not in cols:
-        conn.execute("ALTER TABLE links ADD COLUMN last_ok_day TEXT")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ip ON links(exit_ip) WHERE exit_ip IS NOT NULL AND status='good'"
-    )
-    conn.commit()
-    return conn
-
-
-def stable_threshold(conn: sqlite3.Connection) -> int:
-    """第 N 天门槛=N，直到 STABLE_DAYS；可调 STABLE_DAYS。"""
-    row = conn.execute(
-        "SELECT MIN(last_ok_day) FROM links WHERE last_ok_day IS NOT NULL"
-    ).fetchone()
-    if not row or not row[0]:
-        return 1
-    try:
-        first = date.fromisoformat(row[0])
-    except ValueError:
-        return 1
-    days = (date.today() - first).days + 1
-    return max(1, min(STABLE_DAYS, days))
-
-
-def _ip_sort_key(ip: str):
-    """IPv4/IPv6 数值排序；解析失败则落到字符串兜底。"""
-    try:
-        return (0, ipaddress.ip_address(ip).packed)
-    except ValueError:
-        return (1, ip.encode())
+    return open_db(DB, readonly=False)
 
 
 def export_txt(conn: sqlite3.Connection) -> None:
-    goods = [r[0] for r in conn.execute(
-        "SELECT link FROM links WHERE status='good' ORDER BY updated_at")]
-    fails = [r[0] for r in conn.execute(
-        "SELECT link FROM links WHERE status='failed' ORDER BY updated_at")]
-    need = stable_threshold(conn)
-    # stable：ok_days 够门槛 + 出口 IP 互不相同；无 IP 不进；同 IP 留 ok_days 高、其次 updated_at 新
-    rows = conn.execute(
-        "SELECT link, exit_ip FROM links "
-        "WHERE ok_days>=? AND exit_ip IS NOT NULL AND exit_ip!='' "
-        "ORDER BY ok_days DESC, updated_at DESC",
-        (need,),
-    ).fetchall()
-    seen_ip: set[str] = set()
-    stables: list[str] = []
-    stable_pairs: list[tuple[str, str]] = []  # (exit_ip, link)
-    for link, ip in rows:
-        if ip in seen_ip:
-            continue
-        seen_ip.add(ip)
-        stables.append(link)
-        stable_pairs.append((ip, link))
-    stable_pairs.sort(key=lambda t: _ip_sort_key(t[0]))
-    GOOD_TXT.write_text("\n".join(goods) + ("\n" if goods else ""))
-    FAILED_TXT.write_text("\n".join(fails) + ("\n" if fails else ""))
-    STABLE_TXT.write_text("\n".join(stables) + ("\n" if stables else ""))
-    STABLE_BY_IP_TXT.write_text(
-        "\n".join(f"{ip} {link}" for ip, link in stable_pairs)
-        + ("\n" if stable_pairs else "")
-    )
+    stats = export_all(conn, DATA, stable_days=STABLE_DAYS)
     log(
-        f"export good={len(goods)} failed={len(fails)} stable={len(stables)} "
-        f"stable_by_ip={len(stable_pairs)} (need ok_days>={need}, cap={STABLE_DAYS})"
+        f"export good_rep={stats['good_representative']} good_total={stats['good_total']} "
+        f"failed={stats['failed']} stable={stats['stable']} "
+        f"stable_by_ip={stats['stable_by_ip']} ip_summary={stats['ip_summary_count']} "
+        f"(need ok_days>={stats['need_days']}, cap={STABLE_DAYS})"
     )
 
 
 def good_count(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM links WHERE status='good'").fetchone()[0]
+    """返回当前可用唯一出口 IP 数量（与 good_links.txt 代表数一致）。"""
+    return conn.execute(
+        "SELECT COUNT(DISTINCT exit_ip) FROM links WHERE status='good' AND exit_ip IS NOT NULL"
+    ).fetchone()[0]
 
 
-def _bump_ok_days(conn: sqlite3.Connection, h: str) -> tuple[int, str]:
-    """探测实际通了就累加 streak（含 IP 撞车那天）；断一天从 1 重计。"""
-    prev = conn.execute(
-        "SELECT ok_days, last_ok_day FROM links WHERE h=?", (h,)
-    ).fetchone()
-    ok_days = (prev[0] if prev else 0) or 0
-    last = prev[1] if prev else None
-    today = date.today().isoformat()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
-    if last == today:
-        pass
-    elif last == yesterday:
-        ok_days += 1
-        last = today
-    else:
-        ok_days = 1
-        last = today
-    return ok_days, last
-
-
-def mark(conn: sqlite3.Connection, link: str, status: str, exit_ip: str | None) -> bool:
-    """记当次结果。good 且 IP 未占用返回 True；IP 撞车记 failed 但保留 ok_days+出口 IP。"""
-    h = link_hash(link)
-    now = time.time()
-    with _lock:
-        if status == "good":
-            # IP 已被别的 good 占用：挤出 good，但探测通了 → 累加 streak、保留出口 IP（方便 stable 去重与日后顶替）
-            if exit_ip:
-                row = conn.execute(
-                    "SELECT 1 FROM links WHERE exit_ip=? AND status='good' AND h!=?",
-                    (exit_ip, h),
-                ).fetchone()
-                if row:
-                    ok_days, last = _bump_ok_days(conn, h)
-                    conn.execute(
-                        "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        (h, link, "failed", exit_ip, ok_days, last, now),
-                    )
-                    conn.commit()
-                    return False
-            ok_days, last = _bump_ok_days(conn, h)
-            conn.execute(
-                "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (h, link, "good", exit_ip, ok_days, last, now),
-            )
-            conn.commit()
-            return True
-        # 探测真不通：streak 清零，出口 IP 清空
-        conn.execute(
-            "INSERT OR REPLACE INTO links(h,link,status,exit_ip,ok_days,last_ok_day,updated_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (h, link, "failed", None, 0, None, now),
-        )
-        conn.commit()
-        return False
-
-
-# ---------- 探针 ----------
+# ---------- 探针与出口 IP 观测 ----------
 def alloc_port() -> int:
     global _next_port
     with _port_lock:
@@ -375,24 +265,68 @@ def cpu_busy() -> float:
         return 0.5
 
 
-def get_exit_ip(proxy: str, timeout: float | None = None) -> str | None:
+def discover_exit_ip(
+    proxy: str,
+    timeout: float | None = None,
+    *,
+    primary_url: str | None = None,
+    fallback_urls: list[str] | None = None,
+    ip_family: str | None = None,
+) -> tuple[str | None, str, str | None, str]:
+    """查询出口 IP 并严格校验单个公网 IP 与协议栈。
+
+    返回: (exit_ip, ip_source, ip_version, reason)
+    默认仅请求 primary_url (https://checkip.amazonaws.com)，不做静默跨源回退。
+    """
     t = TIMEOUT if timeout is None else timeout
-    for url in IP_URLS:
+    p_url = primary_url if primary_url is not None else IP_CHECK_URL
+    fb_urls = fallback_urls if fallback_urls is not None else IP_FALLBACK_URLS
+    fam = ip_family if ip_family is not None else IP_FAMILY
+
+    urls = [u for u in [p_url, *fb_urls] if u]
+    if not urls:
+        return None, "unknown", None, "ip_config"
+
+    last_src = extract_ip_source(urls[0])
+    last_reason = "ip_http"
+
+    for url in urls:
+        src = extract_ip_source(url)
+        last_src = src
         try:
-            ip = http_get(url, timeout=t, proxy=proxy).decode().strip()
-            if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
-                return ip
+            raw = http_get(url, timeout=t, proxy=proxy, ip_family=fam).decode(
+                "utf-8", "ignore"
+            )
         except Exception:
+            last_reason = "ip_http"
             continue
-    return None
+
+        ip, ver, v_reason = parse_and_validate_exit_ip(
+            raw, allowed_family=fam, require_global=True
+        )
+        if ip and ver:
+            return ip, src, ver, "ok"
+        last_reason = v_reason
+
+    return None, last_src, None, last_reason
 
 
-def probe(link: str, timeout: float | None = None) -> tuple[str, str | None, str]:
-    """测一条链接：通探针 + 能取到出口 IP 才算 good。按协议选 xray / sing-box。"""
+def get_exit_ip(proxy: str, timeout: float | None = None) -> str | None:
+    """兼容旧调用接口：仅返回出口 IP 字符串或 None。"""
+    ip, _src, _ver, _reason = discover_exit_ip(proxy, timeout=timeout)
+    return ip
+
+
+def probe_detailed(
+    link: str, timeout: float | None = None
+) -> tuple[str, str | None, str, str | None, str | None, bool]:
+    """测一条链接并返回完整观测元数据：
+    (status, exit_ip, reason, ip_source, ip_version, probe_ok)
+    """
     t = TIMEOUT if timeout is None else timeout
     parsed = parse_link(link)
     if not parsed:
-        return "failed", None, "parse"
+        return "failed", None, "parse", None, None, False
     engine, outbound = parsed["engine"], parsed["outbound"]
     socks_port = alloc_port()
     cfg_path = Path(f"/tmp/probe_{engine}_{socks_port}.json")
@@ -403,7 +337,7 @@ def probe(link: str, timeout: float | None = None) -> tuple[str, str | None, str
         write_singbox_cfg(cfg_path, outbound, socks_port)
         cmd = [SINGBOX_BIN, "run", "-c", str(cfg_path)]
     else:
-        return "failed", None, "engine"
+        return "failed", None, "engine", None, None, False
     proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -412,11 +346,12 @@ def probe(link: str, timeout: float | None = None) -> tuple[str, str | None, str
         try:
             http_get(PROBE_URL, timeout=t, proxy=proxy)
         except Exception:
-            return "failed", None, "917"
-        ip = get_exit_ip(proxy, timeout=t)
+            return "failed", None, "917", None, None, False
+
+        ip, src, ver, ip_reason = discover_exit_ip(proxy, timeout=t)
         if not ip:
-            return "failed", None, "ip"
-        return "good", ip, "ok"
+            return "failed", None, ip_reason, src, None, True
+        return "good", ip, "ok", src, ver, True
     finally:
         if proc and proc.poll() is None:
             try:
@@ -429,42 +364,120 @@ def probe(link: str, timeout: float | None = None) -> tuple[str, str | None, str
             pass
 
 
+def probe(link: str, timeout: float | None = None) -> tuple[str, str | None, str]:
+    """兼容三元组接口：(status, exit_ip, reason)。"""
+    status, ip, reason, _src, _ver, _probe_ok = probe_detailed(link, timeout=timeout)
+    return status, ip, reason
+
+
+def _invoke_probe(
+    link: str, timeout: float | None
+) -> tuple[str, str | None, str, str | None, str | None, bool]:
+    """若测试 monkeypatch 了 select_links.probe，也能自动兼容。"""
+    if probe is not _ORIG_PROBE:
+        status, ip, reason = probe(link, timeout)
+        if status == "good" and ip:
+            c_ip, ver, v_reason = parse_and_validate_exit_ip(
+                ip, allowed_family="any", require_global=True
+            )
+            if c_ip:
+                return "good", c_ip, "ok", extract_ip_source(IP_CHECK_URL), ver, True
+            return "failed", None, v_reason, extract_ip_source(IP_CHECK_URL), None, True
+        probe_ok = (reason or "").startswith("ip")
+        src = extract_ip_source(IP_CHECK_URL) if probe_ok else None
+        return "failed", None, reason, src, None, probe_ok
+    return probe_detailed(link, timeout)
+
+
+_ORIG_PROBE = probe
+
+
+def _run_probes_parallel(
+    links: list[str],
+    *,
+    workers: int,
+    timeout: float | None,
+    stage: str,
+    seq_tracker: dict[str, int],
+) -> list[ProbeRecord]:
+    records: list[ProbeRecord] = []
+    if not links:
+        return records
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        start_times = {link: time.time() for link in links}
+        futs = {ex.submit(_invoke_probe, link, timeout): link for link in links}
+        for fut in as_completed(futs):
+            link = futs[fut]
+            end_ts = time.time()
+            dur_ms = int(max(0.0, (end_ts - start_times.get(link, end_ts)) * 1000))
+            try:
+                status, ip, reason, src, ver, probe_ok = fut.result()
+            except Exception:
+                status, ip, reason, src, ver, probe_ok = (
+                    "failed",
+                    None,
+                    "exc",
+                    None,
+                    None,
+                    False,
+                )
+            h = link_hash(link)
+            seq_key = f"{stage}:{h}"
+            seq = seq_tracker.get(seq_key, 0) + 1
+            seq_tracker[seq_key] = seq
+            records.append(
+                ProbeRecord(
+                    link=link,
+                    status="good" if (status == "good" and ip) else "failed",
+                    exit_ip=ip if status == "good" else None,
+                    reason=reason,
+                    ts=end_ts,
+                    stage=stage,
+                    seq=seq,
+                    ip_source=src,
+                    ip_version=ver,
+                    probe_ok=probe_ok,
+                    duration_ms=dur_ms,
+                )
+            )
+    return records
+
+
 def probe_batch(
     conn: sqlite3.Connection,
+    run_key: str,
     links: list[str],
     *,
     workers: int | None = None,
     timeout: float | None = None,
     tag: str = "PROBE",
+    seq_tracker: dict[str, int] | None = None,
 ) -> tuple[int, int]:
-    """探测一批链接并 mark；返回 (tested, added_good_count)。"""
+    """探测一批链接并单事务批量落库；返回 (tested, good_links_count)。"""
     if not links:
         return 0, 0
-    workers = workers if workers is not None else min(WORKERS_MAX, max(WORKERS_MIN, 64))
-    tested = added = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(probe, link, timeout): link for link in links}
-        for fut in as_completed(futs):
-            link = futs[fut]
-            tested += 1
-            try:
-                status, ip, reason = fut.result()
-            except Exception:
-                status, ip, reason = "failed", None, "exc"
-            if status == "good":
-                if mark(conn, link, "good", ip):
-                    added += 1
-                    log(f"{tag}_GOOD ip={ip} good_total={good_count(conn)}")
-                else:
-                    log(f"{tag}_DUP_IP ip={ip}")
-            else:
-                mark(conn, link, "failed", None)
-                log(f"{tag}_FAIL reason={reason}")
+    w = workers if workers is not None else min(WORKERS_MAX, max(WORKERS_MIN, 64))
+    tracker = seq_tracker if seq_tracker is not None else {}
+    records = _run_probes_parallel(
+        links, workers=w, timeout=timeout, stage=tag.lower(), seq_tracker=tracker
+    )
+    tested, added = record_probe_batch(
+        conn, run_key, records, default_ip_source=extract_ip_source(IP_CHECK_URL)
+    )
+    cur_unique_ips = good_count(conn)
+    for rec in records:
+        if rec.status == "good":
+            log(
+                f"{tag}_GOOD ip={rec.exit_ip} src={rec.ip_source} "
+                f"ver={rec.ip_version} unique_good_ips={cur_unique_ips}"
+            )
+        else:
+            log(f"{tag}_FAIL reason={rec.reason} probe_ok={int(bool(rec.probe_ok))}")
     return tested, added
 
 
 def pick_collision_reclaim(conn: sqlite3.Connection, vacated_ips: set[str]) -> list[str]:
-    """对每个空出的出口 IP，取最多 COLLISION_RETRY_PER_IP 条撞车 failed。"""
+    """兼容旧库遗留的同 IP 撞车 failed（status='failed' 且仍带 exit_ip）。"""
     out: list[str] = []
     seen: set[str] = set()
     for ip in sorted(vacated_ips):
@@ -513,8 +526,10 @@ def pick_cooled_failed(
     return out
 
 
-def retest_goods(conn: sqlite3.Connection) -> set[str]:
-    """复测现有 good；返回本轮空出的出口 IP 集合。"""
+def retest_goods(
+    conn: sqlite3.Connection, run_key: str, seq_tracker: dict[str, int]
+) -> set[str]:
+    """复测现有 good；返回本轮完全空出的出口 IP 集合。"""
     rows = conn.execute(
         "SELECT link, exit_ip FROM links WHERE status='good'"
     ).fetchall()
@@ -523,20 +538,14 @@ def retest_goods(conn: sqlite3.Connection) -> set[str]:
     old_ips = {ip for _, ip in rows if ip}
     links = [link for link, _ in rows]
     log(f"retest previous goods={len(links)}")
-    with ThreadPoolExecutor(max_workers=min(64, WORKERS_MAX)) as ex:
-        futs = {ex.submit(probe, link): link for link in links}
-        for fut in as_completed(futs):
-            link = futs[fut]
-            try:
-                status, ip, reason = fut.result()
-            except Exception:
-                status, ip, reason = "failed", None, "exc"
-            if status == "good" and ip:
-                if not mark(conn, link, "good", ip):
-                    log(f"RETEST_DUP ip={ip}")
-            else:
-                mark(conn, link, "failed", None)
-                log(f"RETEST_FAIL reason={reason}")
+    probe_batch(
+        conn,
+        run_key,
+        links,
+        workers=min(64, WORKERS_MAX),
+        tag="RETEST",
+        seq_tracker=seq_tracker,
+    )
     still = {
         r[0]
         for r in conn.execute(
@@ -548,169 +557,198 @@ def retest_goods(conn: sqlite3.Connection) -> set[str]:
     return vacated
 
 
-def verify_goods(conn: sqlite3.Connection) -> None:
-    """收尾复验：再测一遍 good，踢掉不通或 IP 撞车的。"""
+def verify_goods(
+    conn: sqlite3.Connection, run_key: str, seq_tracker: dict[str, int]
+) -> None:
+    """收尾复验：再测一遍当前 good，剔除掉线的链接（同 IP 多条均通时全部保留真实 good，导出时自动按 IP 去重）。"""
     rows = conn.execute(
-        "SELECT link, exit_ip FROM links WHERE status='good' ORDER BY updated_at"
+        "SELECT link FROM links WHERE status='good' ORDER BY updated_at"
     ).fetchall()
-    log(f"verify start count={len(rows)}")
-    seen: set[str] = set()
-    keep = drop = 0
-    with ThreadPoolExecutor(max_workers=min(64, max(8, WORKERS_MAX // 2))) as ex:
-        futs = {ex.submit(probe, link): (link, old_ip) for link, old_ip in rows}
-        for fut in as_completed(futs):
-            link, old_ip = futs[fut]
-            try:
-                status, ip, reason = fut.result()
-            except Exception:
-                status, ip, reason = "failed", None, "exc"
-            if status != "good" or not ip or ip in seen:
-                mark(conn, link, "failed", None)
-                drop += 1
-                log(f"VERIFY_DROP reason={reason or 'dup'} old_ip={old_ip}")
-                continue
-            seen.add(ip)
-            if ip != old_ip:
-                mark(conn, link, "good", ip)
-            keep += 1
+    links = [r[0] for r in rows]
+    log(f"verify start count={len(links)}")
+    records = _run_probes_parallel(
+        links,
+        workers=min(64, max(8, WORKERS_MAX // 2)),
+        timeout=None,
+        stage="verify",
+        seq_tracker=seq_tracker,
+    )
+    record_probe_batch(
+        conn, run_key, records, default_ip_source=extract_ip_source(IP_CHECK_URL)
+    )
+    keep = sum(1 for r in records if r.status == "good")
+    drop = len(records) - keep
     export_txt(conn)
-    log(f"verify done keep={keep} drop={drop} unique_ip={len(seen)}")
+    log(f"verify done keep={keep} drop={drop} unique_ip={good_count(conn)}")
 
 
 # ---------- 主流程 ----------
 def main() -> int:
     DATA.mkdir(parents=True, exist_ok=True)
     conn = db_connect()
-    start_good = good_count(conn)
-    log(f"start good={start_good} target={TARGET} stable_days={STABLE_DAYS}")
-    log(f"xray_bin={XRAY_BIN} singbox_bin={SINGBOX_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
-    log(
-        f"reclaim enable={COLLISION_RETRY_ENABLE} per_ip={COLLISION_RETRY_PER_IP} "
-        f"retry enable={RETRY_FAILED_ENABLE} after_days={RETRY_AFTER_DAYS} "
-        f"max={RETRY_FAILED_MAX} retry_timeout={RETRY_PROBE_TIMEOUT}"
-    )
+    run_key = begin_run(conn, ip_source=extract_ip_source(IP_CHECK_URL))
+    seq_tracker: dict[str, int] = {}
 
-    reclaim_added = 0
-    retry_added = 0
-    probed_hashes: set[str] = set()
+    def _handle_signal(signum: int, _frame) -> None:
+        log(f"received signal {signum}, marking run {run_key} interrupted and exporting")
+        try:
+            end_run(conn, run_key, status="interrupted")
+            export_txt(conn)
+        finally:
+            conn.close()
+        sys.exit(128 + signum)
 
-    # 1) 复测现有 good，收集空出的出口 IP
-    vacated_ips: set[str] = set()
-    old_goods = conn.execute(
-        "SELECT 1 FROM links WHERE status='good' LIMIT 1"
-    ).fetchone()
-    if old_goods:
-        vacated_ips = retest_goods(conn)
-        export_txt(conn)
-        for (h,) in conn.execute("SELECT h FROM links WHERE status='good'"):
-            probed_hashes.add(h)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
-    # 2) 撞车顶替（TARGET 已满也跑：便宜且能补回掉线 IP）
-    if COLLISION_RETRY_ENABLE and vacated_ips:
-        reclaim_links = pick_collision_reclaim(conn, vacated_ips)
-        tested_r, reclaim_added = probe_batch(
-            conn, reclaim_links, workers=min(64, WORKERS_MAX), tag="RECLAIM"
-        )
-        probed_hashes.update(link_hash(x) for x in reclaim_links)
-        log(f"RECLAIM done tested={tested_r} added={reclaim_added}")
-
-    # 3) 已达 TARGET：复测+顶替后直接 verify
-    if TARGET > 0 and good_count(conn) >= TARGET:
-        log("already enough after retest/reclaim — verify + export")
-        verify_goods(conn)
+    try:
+        start_good = good_count(conn)
         log(
-            f"done good={good_count(conn)} reclaim_added={reclaim_added} "
-            f"retry_added={retry_added}"
+            f"start run_key={run_key} good_unique_ips={start_good} target={TARGET} "
+            f"stable_days={STABLE_DAYS} ip_check_url={IP_CHECK_URL} ip_family={IP_FAMILY}"
+        )
+        log(f"xray_bin={XRAY_BIN} singbox_bin={SINGBOX_BIN} probe={PROBE_URL} workers={WORKERS_MIN}-{WORKERS_MAX}")
+        log(
+            f"reclaim enable={COLLISION_RETRY_ENABLE} per_ip={COLLISION_RETRY_PER_IP} "
+            f"retry enable={RETRY_FAILED_ENABLE} after_days={RETRY_AFTER_DAYS} "
+            f"max={RETRY_FAILED_MAX} retry_timeout={RETRY_PROBE_TIMEOUT}"
+        )
+
+        reclaim_added = 0
+        retry_added = 0
+        probed_hashes: set[str] = set()
+
+        # 1) 复测现有 good，收集空出的出口 IP
+        vacated_ips: set[str] = set()
+        old_goods = conn.execute(
+            "SELECT 1 FROM links WHERE status='good' LIMIT 1"
+        ).fetchone()
+        if old_goods:
+            vacated_ips = retest_goods(conn, run_key, seq_tracker)
+            export_txt(conn)
+            for (h,) in conn.execute("SELECT h FROM links WHERE status='good'"):
+                probed_hashes.add(h)
+
+        # 2) 撞车顶替（兼容旧库中曾因同 IP 撞车被标 failed 但带 exit_ip 的候选）
+        if COLLISION_RETRY_ENABLE and vacated_ips:
+            reclaim_links = pick_collision_reclaim(conn, vacated_ips)
+            tested_r, reclaim_added = probe_batch(
+                conn,
+                run_key,
+                reclaim_links,
+                workers=min(64, WORKERS_MAX),
+                tag="RECLAIM",
+                seq_tracker=seq_tracker,
+            )
+            probed_hashes.update(link_hash(x) for x in reclaim_links)
+            log(f"RECLAIM done tested={tested_r} added={reclaim_added}")
+
+        # 3) 已达 TARGET：复测+顶替后直接 verify
+        if TARGET > 0 and good_count(conn) >= TARGET:
+            log("already enough after retest/reclaim — verify + export")
+            verify_goods(conn, run_key, seq_tracker)
+            end_run(conn, run_key, status="completed")
+            purge_old_observations(conn)
+            log(
+                f"done good={good_count(conn)} reclaim_added={reclaim_added} "
+                f"retry_added={retry_added}"
+            )
+            return 0
+
+        # 4) 订阅新候选（跳过库内已有 good/failed）
+        candidates = fetch_candidates()
+        skip = {
+            r[0]
+            for r in conn.execute(
+                "SELECT h FROM links WHERE status IN ('good','failed')"
+            )
+        }
+        todo = []
+        skipped_unrun = 0
+        for c in candidates:
+            h = link_hash(c)
+            if h in skip:
+                continue
+            if not parse_link(c):
+                skipped_unrun += 1
+                continue
+            todo.append(c)
+        log(f"candidates={len(candidates)} todo={len(todo)} skip_unrunnable={skipped_unrun}")
+
+        # 5) 批量测全新候选
+        workers = WORKERS_MAX
+        tested = added = 0
+        since_flush = 0
+        i = 0
+        while i < len(todo) and (TARGET <= 0 or good_count(conn) < TARGET):
+            busy = cpu_busy()
+            if busy > 3.0:
+                workers = max(WORKERS_MIN, workers - 8)
+            elif busy < 1.0:
+                workers = min(WORKERS_MAX, workers + 8)
+            batch = todo[i : i + workers * 2]
+            i += len(batch)
+            probed_hashes.update(link_hash(x) for x in batch)
+            records = _run_probes_parallel(
+                batch,
+                workers=workers,
+                timeout=None,
+                stage="candidate",
+                seq_tracker=seq_tracker,
+            )
+            b_tested, b_good = record_probe_batch(
+                conn,
+                run_key,
+                records,
+                default_ip_source=extract_ip_source(IP_CHECK_URL),
+            )
+            tested += b_tested
+            added += b_good
+            since_flush += b_good
+            if since_flush >= 50:
+                export_txt(conn)
+                since_flush = 0
+            log(
+                f"progress tested={tested} added_links={added} unique_good_ips={good_count(conn)} "
+                f"workers={workers} load={busy:.2f}"
+            )
+
+        # 6) 冷却重试普通 failed（仍缺额或无 TARGET 时）
+        if RETRY_FAILED_ENABLE and (TARGET <= 0 or good_count(conn) < TARGET):
+            exclude = set(probed_hashes)
+            exclude.update(
+                r[0] for r in conn.execute("SELECT h FROM links WHERE status='good'")
+            )
+            retry_links = pick_cooled_failed(conn, RETRY_FAILED_MAX, exclude)
+            tested_t, retry_added = probe_batch(
+                conn,
+                run_key,
+                retry_links,
+                workers=min(64, WORKERS_MAX),
+                timeout=RETRY_PROBE_TIMEOUT,
+                tag="RETRY",
+                seq_tracker=seq_tracker,
+            )
+            log(f"RETRY done tested={tested_t} added={retry_added}")
+
+        export_txt(conn)
+        log(
+            f"probe done unique_good_ips={good_count(conn)} tested={tested} added={added} "
+            f"reclaim_added={reclaim_added} retry_added={retry_added}"
+        )
+        verify_goods(conn, run_key, seq_tracker)
+        end_run(conn, run_key, status="completed")
+        purged = purge_old_observations(conn)
+        if purged:
+            log(f"purged old observations={purged}")
+        export_txt(conn)
+        log(
+            f"done unique_good_ips={good_count(conn)} tested={tested} added={added} "
+            f"reclaim_added={reclaim_added} retry_added={retry_added}"
         )
         return 0
-
-    # 4) 订阅新候选（跳过库内已有 good/failed）
-    candidates = fetch_candidates()
-    skip = {r[0] for r in conn.execute(
-        "SELECT h FROM links WHERE status IN ('good','failed')")}
-    todo = []
-    skipped_unrun = 0
-    for c in candidates:
-        h = link_hash(c)
-        if h in skip:
-            continue
-        if not parse_link(c):
-            skipped_unrun += 1
-            continue
-        todo.append(c)
-    log(f"candidates={len(candidates)} todo={len(todo)} skip_unrunnable={skipped_unrun}")
-
-    # 5) 只测全新候选
-    workers = WORKERS_MAX
-    tested = added = 0
-    since_flush = 0
-    i = 0
-    while i < len(todo) and (TARGET <= 0 or good_count(conn) < TARGET):
-        busy = cpu_busy()
-        if busy > 3.0:
-            workers = max(WORKERS_MIN, workers - 8)
-        elif busy < 1.0:
-            workers = min(WORKERS_MAX, workers + 8)
-        batch = todo[i : i + workers * 2]
-        i += len(batch)
-        probed_hashes.update(link_hash(x) for x in batch)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(probe, link): link for link in batch}
-            for fut in as_completed(futs):
-                link = futs[fut]
-                tested += 1
-                try:
-                    status, ip, reason = fut.result()
-                except Exception:
-                    status, ip, reason = "failed", None, "exc"
-                if status == "good":
-                    if mark(conn, link, "good", ip):
-                        added += 1
-                        since_flush += 1
-                        log(f"GOOD ip={ip} good_total={good_count(conn)} (+{added})")
-                    else:
-                        log(f"DUP_IP ip={ip}")
-                else:
-                    mark(conn, link, "failed", None)
-                if since_flush >= 50:
-                    export_txt(conn)
-                    since_flush = 0
-                if TARGET > 0 and good_count(conn) >= TARGET:
-                    break
-        log(
-            f"progress tested={tested} added={added} good={good_count(conn)} "
-            f"workers={workers} load={busy:.2f}"
-        )
-
-    # 6) 冷却重试普通 failed（仍缺额或无 TARGET 时）
-    if RETRY_FAILED_ENABLE and (TARGET <= 0 or good_count(conn) < TARGET):
-        exclude = set(probed_hashes)
-        exclude.update(
-            r[0] for r in conn.execute(
-                "SELECT h FROM links WHERE status='good'"
-            )
-        )
-        retry_links = pick_cooled_failed(conn, RETRY_FAILED_MAX, exclude)
-        tested_t, retry_added = probe_batch(
-            conn,
-            retry_links,
-            workers=min(64, WORKERS_MAX),
-            timeout=RETRY_PROBE_TIMEOUT,
-            tag="RETRY",
-        )
-        log(f"RETRY done tested={tested_t} added={retry_added}")
-
-    export_txt(conn)
-    log(
-        f"probe done good={good_count(conn)} tested={tested} added={added} "
-        f"reclaim_added={reclaim_added} retry_added={retry_added}"
-    )
-    verify_goods(conn)
-    log(
-        f"done good={good_count(conn)} tested={tested} added={added} "
-        f"reclaim_added={reclaim_added} retry_added={retry_added}"
-    )
-    return 0
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

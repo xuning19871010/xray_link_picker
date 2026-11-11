@@ -3,10 +3,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "22 * * * *"
-# 每小时触发，上一趟未结束时排队等待，不取消旧的
+# 每小时触发，上一趟未结束时排队等待，不取消旧的（串行化 RESTORE -> PROBE -> PUBLISH）
 concurrency:
   group: select_xray_links
   cancel-in-progress: false
+
 jobs:
   select:
     runs-on: ubuntu-latest
@@ -17,27 +18,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 恢复 sqlite：优先从 Release latest 下载；没有则回退到上一份 Artifact（首次迁移时 ok_days 不断）
-      - name: restore state.sqlite (release, fallback artifact)
-        continue-on-error: true
+      # 恢复 sqlite：优先从本仓库 Release latest 下载并校验完整性；失败则回退未过期 Artifact。
+      # 严格区分「首次引导（无 Release 且无 Artifact）」与「恢复/校验失败（拒绝静默建空库覆盖历史）」。
+      - name: restore state.sqlite (release, fallback artifact, verify integrity)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mkdir -p data
-          if gh release download latest -R "${{ github.repository }}" -p state.sqlite -D data --clobber 2>/dev/null; then
-            echo "restored state.sqlite from release latest"
-            ls -la data/state.sqlite
-            exit 0
+          sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 unzip curl
+
+           check_db() {
+            local f="$1"
+            [ -s "$f" ] || return 1
+            local res
+            res=$(sqlite3 "$f" "PRAGMA quick_check;" 2>/dev/null | head -1 || true)
+            [ "$res" = "ok" ]
+          }
+
+          HAS_RELEASE=0
+          if gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
+            HAS_RELEASE=1
           fi
-          echo "release 无 state.sqlite，回退 artifact"
-          AID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-sqlite&per_page=5" \
-            --jq '[.artifacts[] | select(.expired==false)][0].id // empty')
-          if [ -z "$AID" ]; then echo "no prior state artifact"; exit 0; fi
-          echo "restoring artifact id=$AID"
-          gh api "repos/${{ github.repository }}/actions/artifacts/$AID/zip" > /tmp/state.zip
-          unzip -o /tmp/state.zip -d data
-          ls -la data/state.sqlite || true
+
+          if [ "$HAS_RELEASE" = "1" ]; then
+            if gh release download latest -R "${{ github.repository }}" -p state.sqlite -D data --clobber 2>/dev/null; then
+              if check_db data/state.sqlite; then
+                echo "restored and verified state.sqlite from release latest"
+                ls -la data/state.sqlite
+                exit 0
+              fi
+              echo "warn: state.sqlite from release latest failed integrity check, falling back to artifacts"
+              rm -f data/state.sqlite
+            else
+              echo "warn: release latest has no state.sqlite or download failed, falling back to artifacts"
+            fi
+          fi
+
+          AIDS=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-sqlite&per_page=10" \
+            --jq '.artifacts[] | select(.expired==false) | .id' || true)
+          if [ -n "$AIDS" ]; then
+            for AID in $AIDS; do
+              echo "trying artifact id=$AID"
+              rm -f /tmp/state.zip data/state.sqlite
+              if gh api "repos/${{ github.repository }}/actions/artifacts/$AID/zip" > /tmp/state.zip 2>/dev/null; then
+                unzip -o /tmp/state.zip -d data || true
+                if check_db data/state.sqlite; then
+                  echo "restored and verified state.sqlite from artifact id=$AID"
+                  ls -la data/state.sqlite
+                  exit 0
+                fi
+              fi
+            done
+          fi
+
+          if [ "$HAS_RELEASE" = "1" ] || [ -n "$AIDS" ]; then
+            echo "ERROR: existing release/artifact found but all state.sqlite recovery attempts failed! Refusing to overwrite history with an empty DB."
+            exit 1
+          fi
+          echo "initial bootstrap: no prior release or artifact found, starting with fresh state.sqlite"
 
       - name: setup
         env:
@@ -45,7 +84,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl unzip python3 openssh-server
+          sudo apt-get install -y -qq curl unzip python3 sqlite3 openssh-server
           curl -fsSL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v25.9.11/Xray-linux-64.zip
           sudo unzip -o /tmp/xray.zip xray -d /usr/local/bin && sudo chmod +x /usr/local/bin/xray
           # sing-box：hy2/hysteria/tuic/anytls 需要
@@ -94,41 +133,62 @@ jobs:
           done
           wait $PID
 
+      - name: validate state.sqlite before publish
+        if: always()
+        run: |
+          if [ -s data/state.sqlite ]; then
+            sqlite3 data/state.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+            CHK=$(sqlite3 data/state.sqlite "PRAGMA quick_check;" | head -1)
+            if [ "$CHK" != "ok" ]; then
+              echo "ERROR: data/state.sqlite failed quick_check: $CHK"
+              exit 1
+            fi
+            sha256sum data/state.sqlite > data/state.sqlite.sha256
+          fi
+
       # Artifact 保留作备份（30 天）：Release 附件被覆盖坏了时还能回退恢复
       - name: upload state.sqlite artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: state-sqlite
-          path: data/state.sqlite
+          path: |
+            data/state.sqlite
+            data/state.sqlite.sha256
           retention-days: 30
           if-no-files-found: warn
 
-      # 结果不再提交进 git：good/stable/stable_by_ip/state.sqlite 覆盖上传到固定 Release（tag latest），仅 xuning 有
-      - name: publish good/stable to release latest
+      # 发布结果到本仓库固定 Release（tag latest）
+      - name: publish good/stable and IP reports to release latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          ls -la data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt data/state.sqlite
+          ls -la data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt \
+            data/ip_day_counts.csv data/ip_summary.csv data/collection_days.csv \
+            data/ip_report.html data/state.sqlite
           NOTE="自动更新于 $(TZ=Asia/Shanghai date '+%F %T') 北京时间；run #${{ github.run_number }}"
-          # 首次运行时创建 Release（tag 指向当前提交），之后只覆盖附件
           if ! gh release view latest -R "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create latest -R "${{ github.repository }}" --target "${{ github.sha }}" \
               --title "latest good/stable links" --notes "$NOTE" --latest
           fi
           # GitHub 拒绝 0 字节 Release 附件（HTTP 400 Bad Content-Length）。
-          # stable 集为空时跳过这两个文件，其余附件照常覆盖上传。
+          # 空文件自动跳过，其余附件覆盖上传。
           assets=()
-          for f in data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt data/state.sqlite; do
-            case "$f" in
-              data/stable_links.txt|data/stable_links_by_ip.txt)
-                if [ ! -s "$f" ]; then
-                  echo "skip empty release asset: $f"
-                  continue
-                fi
-                ;;
-            esac
+          for f in \
+            data/good_links.txt \
+            data/stable_links.txt \
+            data/stable_links_by_ip.txt \
+            data/ip_day_counts.csv \
+            data/ip_summary.csv \
+            data/collection_days.csv \
+            data/ip_report.html \
+            data/state.sqlite \
+            data/state.sqlite.sha256; do
+            if [ ! -s "$f" ]; then
+              echo "skip empty release asset: $f"
+              continue
+            fi
             assets+=("$f")
           done
           gh release upload latest "${assets[@]}" --clobber -R "${{ github.repository }}"
