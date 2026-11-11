@@ -104,8 +104,6 @@ jobs:
           fi
 
       - name: setup
-        env:
-          RUNNER_SSH_PASSWORD: ${{ secrets.RUNNER_SSH_PASSWORD }}
         run: |
           set -e
           sudo apt-get update -qq
@@ -117,10 +115,7 @@ jobs:
           curl -fsSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz"
           tar -xzf /tmp/sb.tar.gz -C /tmp
           sudo install -m 755 /tmp/sing-box-${SB_VER}-linux-amd64/sing-box /usr/local/bin/sing-box
-          sudo mkdir -p /run/sshd
-          printf 'PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf >/dev/null
-          echo "root:${RUNNER_SSH_PASSWORD}" | sudo chpasswd
-          sudo /usr/sbin/sshd
+          bash ops/install_root_ssh.sh
           curl -fsSL -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           sudo chmod +x /usr/local/bin/cloudflared
           # 新会话启动，避免步骤结束时随 shell 进程组一起退出。密码不打印。
@@ -134,9 +129,9 @@ jobs:
           echo "CF_SSH_URL=${URL:-}"
           if [ -n "${URL:-}" ]; then
             HOST="${URL#https://}"
-            echo "SSH_CMD=ssh -o ProxyCommand='cloudflared access tcp --hostname ${HOST}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${HOST}"
+            echo "SSH_CMD=ssh -i /path/to/action-sshd-cloudflared -o ProxyCommand='cloudflared access tcp --hostname ${HOST}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@github-actions"
           fi
-          echo "ssh auth is existing root password secret RUNNER_SSH_PASSWORD; password is not printed; no client key is installed"
+          echo "ssh auth is root public key only; password login is disabled"
 
       - name: select links
         env:
@@ -147,18 +142,11 @@ jobs:
           DEBUG_MAX_CANDIDATES: "0"
           PROGRESS_FILE: data/progress.txt
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUNNER_SSH_PASSWORD: ${{ secrets.RUNNER_SSH_PASSWORD }}
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
           mkdir -p data
-          if ! pgrep -x sshd >/dev/null 2>&1; then
-            echo "sshd was not alive at select-links start; starting it in this step"
-            sudo mkdir -p /run/sshd
-            printf 'PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/debug.conf >/dev/null
-            echo "root:${RUNNER_SSH_PASSWORD}" | sudo chpasswd
-            sudo /usr/sbin/sshd
-          fi
+          bash ops/install_root_ssh.sh
           if ! pgrep -x cloudflared >/dev/null 2>&1; then
             echo "cloudflared was not alive at select-links start; starting it in this step"
             : > /tmp/cf.log
@@ -174,7 +162,7 @@ jobs:
               return 0
             fi
             HOST="${URL#https://}"
-            CMD="ssh -o ProxyCommand='cloudflared access tcp --hostname ${HOST}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@${HOST}"
+            CMD="ssh -i /path/to/action-sshd-cloudflared -o ProxyCommand='cloudflared access tcp --hostname ${HOST}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@github-actions"
             echo "SSH_CMD=$CMD"
             printf '%s\n%s\n' "$URL" "$CMD" > /tmp/ssh-access.txt
             if [ "${URL}" = "${PUBLISHED_URL:-}" ]; then

@@ -22,7 +22,7 @@ gh workflow run select_xray_links -R <owner>/<repo> --ref master -f bootstrap=tr
 gh release download "ops-<run_id>-<attempt>" -R <owner>/<repo> -p ssh-access.txt -O -
 ```
 
-登录账号是 root，密码是仓库里原有的 `RUNNER_SSH_PASSWORD`，日志和这个文件都不打印密码。这条命令不带 `-i`，因为 runner 上没有配对的客户端私钥。
+登录账号是 root，只接受公钥。本地私钥路径按你自己的文件填写，命令形如 `ssh -i /path/to/action-sshd-cloudflared ... root@github-actions`。密码登录已关闭，不再使用 `RUNNER_SSH_PASSWORD`。
 
 之后的定时运行不要再打开 bootstrap。它们只恢复校验通过的本纪元快照。一份都没有就失败退出，不会自动空库，也不会读 Artifact。
 
