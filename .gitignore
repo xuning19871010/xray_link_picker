@@ -4,3 +4,4 @@ data/state.sqlite*
 data/*.txt
 data/*.csv
 data/*.html
+data/*.tsv

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import io
 import ipaddress
 import json
 import sqlite3
@@ -26,6 +27,87 @@ def ip_sort_key(ip: str) -> tuple[int, bytes]:
         return (0, ipaddress.ip_address(ip).packed)
     except ValueError:
         return (1, ip.encode("utf-8"))
+
+
+# 正式 Release 附件。空文件不上传。good_links_by_ip.tsv 至少有表头，因此总会上传。
+RELEASE_ASSETS = (
+    "good_links.txt",
+    "good_links_by_ip.tsv",
+    "stable_links.txt",
+    "stable_links_by_ip.txt",
+    "ip_day_counts.csv",
+    "ip_summary.csv",
+    "collection_days.csv",
+    "ip_report.html",
+    "state.sqlite",
+    "state.sqlite.sha256",
+    "epoch.txt",
+)
+
+
+def _measured_exit_ip(raw: str | None) -> tuple[int, int, str]:
+    """库内实测出口。返回 (家族, 地址整数, 写出的文本)。
+
+    家族顺序：IPv4=0，IPv6=1，缺失或无法解析成单个地址=2。
+    只接受 links.exit_ip 里的一个 IP，不读链接 host。缺失、空白、多值或解析失败时文本为空。
+    """
+    text = (raw or "").strip()
+    if not text or any(ch.isspace() for ch in text) or "," in text:
+        return 2, 0, ""
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return 2, 0, ""
+    family = 0 if addr.version == 4 else 1
+    return family, int(addr), addr.compressed
+
+
+def good_links_by_ip_rows(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """全部 status=good，不按 IP 去重。同地址按解码后的 link 排序。"""
+    ranked: list[tuple[int, int, str, str, str]] = []
+    for exit_ip, link in conn.execute("SELECT exit_ip, link FROM links WHERE status='good'"):
+        family, number, ip_text = _measured_exit_ip(exit_ip)
+        raw = link or ""
+        shown = html.unescape(raw)
+        ranked.append((family, number, shown, raw, ip_text))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    return [(ip_text, shown) for _family, _number, shown, _raw, ip_text in ranked]
+
+
+def render_good_links_by_ip(conn: sqlite3.Connection) -> str:
+    """TSV：表头 exit_ip、link。link 做一次 HTML 实体解码，不再编码。"""
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(("exit_ip", "link"))
+    writer.writerows(good_links_by_ip_rows(conn))
+    return buf.getvalue()
+
+
+def validate_good_links_tsv(conn: sqlite3.Connection, path: Path) -> None:
+    actual = path.read_text(encoding="utf-8")
+    expected = render_good_links_by_ip(conn)
+    if actual != expected:
+        raise ValueError("good_links_by_ip.tsv 与当前 good 链接不一致")
+
+
+def partition_release_assets(data_dir: Path) -> tuple[list[Path], list[Path]]:
+    """返回 (上传, 跳过)。跳过的是缺失或空文件。"""
+    upload: list[Path] = []
+    skip: list[Path] = []
+    for name in RELEASE_ASSETS:
+        path = data_dir / name
+        if path.is_file() and path.stat().st_size > 0:
+            upload.append(path)
+        else:
+            skip.append(path)
+    return upload, skip
+
+
+def missing_release_assets(data_dir: Path, uploaded_names: list[str]) -> list[str]:
+    """本地应上传、但 Release 上还没有的文件名。"""
+    upload, _skip = partition_release_assets(data_dir)
+    have = set(uploaded_names)
+    return [path.name for path in upload if path.name not in have]
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -151,10 +233,12 @@ def export_all(
     stable_pairs = select_representative_stables(conn, need)
     stables = [link for _ip, link in stable_pairs]
     stable_by_ip = sorted(stable_pairs, key=lambda t: (ip_sort_key(t[0]), t[1]))
+    good_by_ip = render_good_links_by_ip(conn)
 
     (data_dir / "good_links.txt").write_text(
         "\n".join(goods) + ("\n" if goods else ""), encoding="utf-8"
     )
+    (data_dir / "good_links_by_ip.tsv").write_text(good_by_ip, encoding="utf-8")
     (data_dir / "failed_links.txt").write_text(
         "\n".join(fails) + ("\n" if fails else ""), encoding="utf-8"
     )
@@ -290,6 +374,7 @@ def export_all(
     return {
         "good_representative": len(goods),
         "good_total": total_good,
+        "good_by_ip": good_by_ip.count("\n") - 1,
         "failed": len(fails),
         "stable": len(stables),
         "stable_by_ip": len(stable_by_ip),

@@ -126,8 +126,11 @@ class TestIpTrackingAndQueries(unittest.TestCase):
         self.assertEqual(q["by_ip"][0]["distinct_link_count"], 2)
 
         stats = export.export_all(conn, self.out_dir, now_ts=t1 + 20)
-        self.assertEqual((stats["good_total"], stats["good_representative"]), (2, 1))
+        self.assertEqual((stats["good_total"], stats["good_representative"], stats["good_by_ip"]), (2, 1, 2))
         self.assertEqual(len((self.out_dir / "good_links.txt").read_text().splitlines()), 1)
+        tsv_lines = (self.out_dir / "good_links_by_ip.tsv").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(tsv_lines[0], "exit_ip\tlink")
+        self.assertEqual(sorted(tsv_lines[1:]), sorted([f"{ip}\t{l1}", f"{ip}\t{l2}"]))
         with open(self.out_dir / "ip_day_counts.csv", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(int(rows[0]["distinct_link_count"]), 2)
@@ -512,6 +515,124 @@ class TestIpTrackingAndQueries(unittest.TestCase):
         )
         self.assertFalse(storage.allow_empty_bootstrap(["archive", "broken"]))
         self.assertEqual(storage.ops_release_tag("42957190275", 1), "ops-42957190275-1")
+
+    def test_13_good_links_by_ip_keeps_every_link_and_sorts_numerically(self) -> None:
+        """全部 good 按实测出口的地址整数排序；10 在 2 后，IPv6 在 IPv4 后，缺失 IP 不拿 host 填。"""
+        conn = storage.open_db(self.db_path)
+        now = ts_shanghai(2026, 11, 13, 12)
+        export.export_all(conn, self.out_dir, now_ts=now)
+        self.assertEqual(
+            (self.out_dir / "good_links_by_ip.tsv").read_text(encoding="utf-8"),
+            "exit_ip\tlink\n",
+        )
+        self.assertEqual((self.out_dir / "good_links.txt").read_text(encoding="utf-8"), "")
+        upload, _skip = export.partition_release_assets(self.out_dir)
+        names = [path.name for path in upload]
+        self.assertEqual(
+            export.RELEASE_ASSETS,
+            (
+                "good_links.txt",
+                "good_links_by_ip.tsv",
+                "stable_links.txt",
+                "stable_links_by_ip.txt",
+                "ip_day_counts.csv",
+                "ip_summary.csv",
+                "collection_days.csv",
+                "ip_report.html",
+                "state.sqlite",
+                "state.sqlite.sha256",
+                "epoch.txt",
+            ),
+        )
+        self.assertIn("good_links_by_ip.tsv", names)
+        self.assertNotIn("good_links.txt", names)
+        self.assertEqual(
+            export.missing_release_assets(self.out_dir, [name for name in names if name != "good_links_by_ip.tsv"]),
+            ["good_links_by_ip.tsv"],
+        )
+        self.assertEqual(export.missing_release_assets(self.out_dir, names), [])
+
+        same_a = "vless://a@node-10.example:443#a"
+        same_b = "vless://b@node-10.example:443#b"
+        ten = "vless://early@node-2.example:443?x=1&amp;y=2#ten"
+        nine = "vless://nine@zz.example:443#nine"
+        six2 = "vless://z@host.example:443#six2"
+        six10 = "vless://z@host.example:443#six10"
+        missing = "vless://m@10.9.9.9:443#missing"
+        invalid = "vless://i@2.2.2.2:443#invalid"
+        multi = "vless://multi@8.8.8.8:443#multi"
+
+        def add(link: str, exit_ip: str | None, updated_at: float) -> None:
+            conn.execute(
+                "INSERT INTO links(h, link, status, exit_ip, updated_at) VALUES(?,?,?,?,?)",
+                (storage.link_hash(link), link, "good", exit_ip, updated_at),
+            )
+
+        add(same_b, "2.0.0.1", 20)
+        add(same_a, "2.0.0.1", 10)
+        add(ten, "10.0.0.1", 30)
+        add(nine, "9.9.9.9", 40)
+        add(six10, "2001:0db8:0000::0010", 50)
+        add(six2, "2001:db8::2", 60)
+        add(missing, None, 70)
+        add(invalid, "not-an-ip", 80)
+        add(multi, "1.2.3.4, 5.6.7.8", 90)
+        conn.execute(
+            "INSERT INTO links(h, link, status, exit_ip, updated_at) VALUES(?,?,?,?,?)",
+            (storage.link_hash("vless://nope@h:1#f"), "vless://nope@h:1#f", "failed", "1.1.1.1", 1),
+        )
+        conn.commit()
+
+        stats = export.export_all(conn, self.out_dir, now_ts=now)
+        self.assertEqual(stats["good_by_ip"], 9)
+        self.assertEqual(stats["good_representative"], 7)
+        export.validate_good_links_tsv(conn, self.out_dir / "good_links_by_ip.tsv")
+        with (self.out_dir / "good_links_by_ip.tsv").open(encoding="utf-8") as handle:
+            rows = list(csv.reader(handle, delimiter="\t"))
+        ten_shown = "vless://early@node-2.example:443?x=1&y=2#ten"
+        self.assertEqual(
+            rows,
+            [
+                ["exit_ip", "link"],
+                ["2.0.0.1", same_a],
+                ["2.0.0.1", same_b],
+                ["9.9.9.9", nine],
+                ["10.0.0.1", ten_shown],
+                ["2001:db8::2", six2],
+                ["2001:db8::10", six10],
+                ["", invalid],
+                ["", missing],
+                ["", multi],
+            ],
+        )
+        self.assertLess(
+            [row[0] for row in rows].index("2.0.0.1"),
+            [row[0] for row in rows].index("10.0.0.1"),
+        )
+        ips = [row[0] for row in rows[1:] if row[0]]
+        self.assertNotEqual(ips, sorted(ips))
+        self.assertEqual([row[0] for row in rows if row[1] == missing], [""])
+        self.assertNotIn("10.9.9.9", [row[0] for row in rows])
+        self.assertNotIn("2.2.2.2", [row[0] for row in rows])
+        self.assertNotIn("&amp;", (self.out_dir / "good_links_by_ip.tsv").read_text(encoding="utf-8"))
+        good_txt = (self.out_dir / "good_links.txt").read_text(encoding="utf-8")
+        self.assertIn("&amp;", good_txt)
+        self.assertNotIn(missing, good_txt)
+        self.assertIn(same_b, good_txt)
+        self.assertNotIn(same_a, good_txt)
+        self.assertNotIn("vless://nope@h:1#f", "\n".join(row[1] for row in rows))
+        broken = self.out_dir / "good_links_by_ip.tsv"
+        broken.write_text(broken.read_text(encoding="utf-8") + "9.9.9.9\textra\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            export.validate_good_links_tsv(conn, broken)
+
+        publish = (ROOT / ".github/workflows/select_xray_links.yml").read_text(encoding="utf-8").split(
+            "- name: publish unique release", 1
+        )[1]
+        self.assertLess(publish.index("validate_good_links_tsv"), publish.index("gh release create"))
+        self.assertLess(publish.index("partition_release_assets"), publish.index("gh release create"))
+        self.assertLess(publish.index("missing_release_assets"), publish.index("--prerelease=false --latest"))
+        conn.close()
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ gh release download "ops-<run_id>-<attempt>" -R <owner>/<repo> -p ssh-access.txt
 | 文件 | 内容说明 | 含敏感链接凭据 |
 |---|---|---|
 | `data/good_links.txt` | 当前状态为 `good` 的代表链接（每个出口 IP 选 1 条代表，出口 IP 互不重复） | 是 |
+| `data/good_links_by_ip.tsv` | 当前全部 `status=good`，不按出口 IP 去重。列是 `exit_ip`、`link`。`exit_ip` 只用库里这次 checkip 测到并写入的值，按 IPv4、IPv6 分族后用地址整数排序；同一地址再按解码后的 link 排序。link 会做一次 HTML 实体解码。空的、多个地址或解析不了的出口留空，链接仍保留，排在合法地址后面。不拿链接里的 host 填空，也不表示别的网站看到的是同一个 IP | 是 |
 | `data/failed_links.txt` | 当前状态为 `failed` 的链接 | 是 |
 | `data/stable_links.txt` | 连续可用天数达标（`ok_days >= 门槛`）的代表链接（出口 IP 互不重复） | 是 |
 | `data/stable_links_by_ip.txt` | 与 `stable_links.txt` 同集，每行 `出口IP 空格 xray_link`，按出口 IP 数值排序 | 是 |

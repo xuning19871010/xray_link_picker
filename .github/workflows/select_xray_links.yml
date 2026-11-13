@@ -218,17 +218,18 @@ jobs:
           run ${{ github.run_id }} attempt ${{ github.run_attempt }}
           北京时间 $(TZ=Asia/Shanghai date '+%F %T')
           $COUNTS"
-          assets=()
-          for f in \
-            data/good_links.txt data/stable_links.txt data/stable_links_by_ip.txt \
-            data/ip_day_counts.csv data/ip_summary.csv data/collection_days.csv \
-            data/ip_report.html data/state.sqlite data/state.sqlite.sha256 data/epoch.txt; do
-            if [ ! -s "$f" ]; then
-              echo "skip empty release asset: $f"
-              continue
-            fi
-            assets+=("$f")
-          done
+          python3 -c 'import sqlite3; from pathlib import Path; import export; conn=sqlite3.connect("data/state.sqlite"); export.validate_good_links_tsv(conn, Path("data/good_links_by_ip.tsv")); conn.close()'
+          python3 - << 'PY'
+          from pathlib import Path
+          import export
+          upload, skip = export.partition_release_assets(Path("data"))
+          Path("/tmp/release-assets.txt").write_text(
+              "".join(f"{path}\n" for path in upload), encoding="utf-8"
+          )
+          for path in skip:
+              print(f"skip empty release asset: {path}")
+          PY
+          mapfile -t assets < /tmp/release-assets.txt
           # 先以 prerelease 上传。未校验完之前不会成为 Latest，恢复逻辑也会跳过它。
           gh release create "$TAG" -R "$REPO" --prerelease --target "${{ github.sha }}" \
             --title "$TAG" --notes "$NOTE" "${assets[@]}"
@@ -236,5 +237,21 @@ jobs:
           mkdir -p /tmp/verify
           gh release download "$TAG" -R "$REPO" -p epoch.txt -p state.sqlite -p state.sqlite.sha256 -D /tmp/verify
           python3 -c 'import storage,sys; from pathlib import Path; sys.exit(0 if storage.classify_snapshot(Path("/tmp/verify"), is_draft=False, is_prerelease=True)=="restorable" else 1)'
+          export TAG REPO
+          python3 - << 'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          import export
+          raw = subprocess.check_output(
+              ["gh", "release", "view", os.environ["TAG"], "-R", os.environ["REPO"], "--json", "assets"],
+              text=True,
+          )
+          missing = export.missing_release_assets(
+              Path("data"),
+              [item["name"] for item in json.loads(raw)["assets"]],
+          )
+          if missing:
+              raise SystemExit("release assets missing: " + ", ".join(missing))
+          PY
           gh release edit "$TAG" -R "$REPO" --prerelease=false --latest
           echo "published $TAG and marked latest"

@@ -3,6 +3,7 @@
 
 输出文件（data/ 目录）：
   data/good_links.txt          — 当次测通代表链接（每个出口 IP 选 1 条代表，出口 IP 不重复）
+  data/good_links_by_ip.tsv    — 全部 status=good，列 exit_ip 与 link，按实测出口 IP 数值排序
   data/stable_links.txt        — 连续成功跑日 streak 达标的代表链接（出口 IP 互不相同）
   data/stable_links_by_ip.txt  — 与 stable 同集，每行「出口IP 空格 xray_link」，按出口 IP 排序
   data/ip_day_counts.csv       — 每日每出口 IP（含 ip_source/ip_version）对应的真实 DISTINCT 成功链接数
@@ -193,7 +194,7 @@ def export_txt(conn: sqlite3.Connection) -> None:
     stats = export_all(conn, DATA, stable_days=STABLE_DAYS)
     log(
         f"export good_rep={stats['good_representative']} good_total={stats['good_total']} "
-        f"failed={stats['failed']} stable={stats['stable']} "
+        f"good_by_ip={stats['good_by_ip']} failed={stats['failed']} stable={stats['stable']} "
         f"stable_by_ip={stats['stable_by_ip']} (need ok_days>={stats['need_days']}, cap={STABLE_DAYS})"
     )
 
